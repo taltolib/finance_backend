@@ -22,8 +22,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY main.py .
 
 # ── Переменные окружения (значения задаются снаружи) ───────
-ENV TELEGRAM_API_ID=""
-ENV TELEGRAM_API_HASH=""
+
 ENV PORT=8000
 
 # ── Порт ───────────────────────────────────────────────────
