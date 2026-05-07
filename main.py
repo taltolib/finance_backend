@@ -560,7 +560,7 @@ async def get_transactions(
     x_session_token: str = Header(...),
     limit: int = 100
 ):
-    """Получаем транзакции из @HUMOcardbot"""
+    """Получаем транзакции только из входящих сообщений @HUMOcardbot"""
     try:
         client = TelegramClient(
             StringSession(x_session_token),
@@ -568,33 +568,52 @@ async def get_transactions(
             API_HASH
         )
         await client.connect()
-        
+
         if not await client.is_user_authorized():
             await client.disconnect()
             raise HTTPException(status_code=401, detail="Сессия истекла")
-        
-        # Получаем сообщения из @HUMOcardbot
-        messages = await client.get_messages('@HUMOcardbot', limit=limit)
-        
+
+        entity = await client.get_entity("@HUMOcardbot")
+        messages = await client.get_messages(entity, limit=limit)
+
         transactions = []
+
         for msg in messages:
+            # Игнорируем сообщения, которые пользователь сам отправил в HUMO bot
+            if msg.out:
+                continue
+
+            # Дополнительно принимаем только сообщения от HUMO bot
+            if msg.sender_id and msg.sender_id != entity.id:
+                continue
+
             if msg.text:
                 tx = parse_humo_message(msg.text, msg.id)
                 if tx:
                     transactions.append(tx.dict())
-        
+
         await client.disconnect()
-        
+
+        income_total = sum(tx["amount"] for tx in transactions if tx["type"] == "income")
+        expense_total = sum(tx["amount"] for tx in transactions if tx["type"] == "expense")
+
         return {
             "success": True,
             "count": len(transactions),
+            "income_total": income_total,
+            "expense_total": expense_total,
+            "currency": "UZS",
             "transactions": transactions
         }
-        
+
     except HTTPException:
         raise
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+
 @app.get("/check-bot")
 async def check_bot(x_session_token: str = Header(...)):
     """Проверяем Telegram-сессию, наличие HUMO bot и подключена ли карта"""
