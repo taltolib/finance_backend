@@ -4,6 +4,7 @@ Finance App Backend
 и отдаёт транзакции Flutter приложению через REST API
 """
 
+from telethon.errors import SessionPasswordNeededError
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -45,6 +46,7 @@ class CodeRequest(BaseModel):
     phone: str
     phone_code_hash: str
     code: str
+    password: Optional[str] = None
 
 class Transaction(BaseModel):
     id: str
@@ -180,7 +182,7 @@ async def verify_code(req: CodeRequest):
     pending = pending_logins.get(req.phone)
     if not pending:
         raise HTTPException(status_code=400, detail="Сначала запросите код")
-    
+
     try:
         client = TelegramClient(
             StringSession(pending["session"]),
@@ -188,20 +190,31 @@ async def verify_code(req: CodeRequest):
             API_HASH
         )
         await client.connect()
-        
-        await client.sign_in(
-            phone=req.phone,
-            code=req.code,
-            phone_code_hash=req.phone_code_hash
-        )
-        
+
+        try:
+            await client.sign_in(
+                phone=req.phone,
+                code=req.code,
+                phone_code_hash=req.phone_code_hash
+            )
+
+        except SessionPasswordNeededError:
+            if not req.password:
+                await client.disconnect()
+                raise HTTPException(
+                    status_code=401,
+                    detail="TWO_STEP_PASSWORD_REQUIRED"
+                )
+
+            await client.sign_in(password=req.password)
+
         # Сохраняем финальную сессию
         session_string = client.session.save()
         user_sessions[req.phone] = session_string
-        
+
         # Получаем инфо о пользователе
         me = await client.get_me()
-        
+
         # Скачиваем фото профиля в память
         photo_base64 = None
         try:
@@ -213,7 +226,7 @@ async def verify_code(req: CodeRequest):
 
         await client.disconnect()
         del pending_logins[req.phone]
-        
+
         return {
             "success": True,
             "session_token": session_string,
@@ -227,9 +240,12 @@ async def verify_code(req: CodeRequest):
                 "photo_base64": photo_base64,
             }
         }
+
+    except HTTPException:
+        raise
+
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
-
 
 @app.get("/transactions")
 async def get_transactions(
