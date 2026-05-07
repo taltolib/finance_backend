@@ -288,10 +288,8 @@ async def get_transactions(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @app.get("/check-bot")
 async def check_bot(x_session_token: str = Header(...)):
-    """Проверяем, есть ли у пользователя @HUMOcardbot в чатах"""
     try:
         client = TelegramClient(
             StringSession(x_session_token),
@@ -299,21 +297,44 @@ async def check_bot(x_session_token: str = Header(...)):
             API_HASH
         )
         await client.connect()
-        
+
+        if not await client.is_user_authorized():
+            await client.disconnect()
+            raise HTTPException(
+                status_code=401,
+                detail="SESSION_EXPIRED"
+            )
+
         try:
-            entity = await client.get_entity('@HUMOcardbot')
-            messages = await client.get_messages('@HUMOcardbot', limit=1)
-            has_messages = len(messages) > 0
+            entity = await client.get_entity("@HUMOcardbot")
+            messages = await client.get_messages(entity, limit=1)
+
+            await client.disconnect()
+
+            return {
+                "success": True,
+                "authorized": True,
+                "has_bot": True,
+                "has_messages": len(messages) > 0,
+                "bot": {
+                    "id": entity.id,
+                    "username": getattr(entity, "username", None),
+                    "title": getattr(entity, "first_name", None)
+                }
+            }
+
         except Exception:
             await client.disconnect()
-            return {"has_bot": False, "has_messages": False}
-        
-        await client.disconnect()
-        return {
-            "has_bot": True,
-            "has_messages": has_messages
-        }
-        
+            return {
+                "success": True,
+                "authorized": True,
+                "has_bot": False,
+                "has_messages": False,
+                "message": "HUMO bot не найден в Telegram-чатах пользователя"
+            }
+
+    except HTTPException:
+        raise
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
