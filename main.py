@@ -461,7 +461,7 @@ async def get_transactions(
         raise HTTPException(status_code=500, detail=str(e))
 @app.get("/check-bot")
 async def check_bot(x_session_token: str = Header(...)):
-    """Проверяем Telegram-сессию, наличие HUMO bot и этап регистрации внутри HUMO bot"""
+    """Проверяем Telegram-сессию, наличие HUMO bot и подключена ли карта"""
     client = None
 
     try:
@@ -483,7 +483,7 @@ async def check_bot(x_session_token: str = Header(...)):
             messages = await client.get_messages(entity, limit=100)
 
             has_messages = len(messages) > 0
-            humo_auth = analyze_humo_auth_state(messages)
+            humo = analyze_humo_connection_state(messages)
 
             return {
                 "success": True,
@@ -495,7 +495,7 @@ async def check_bot(x_session_token: str = Header(...)):
                     "username": getattr(entity, "username", None),
                     "title": getattr(entity, "first_name", None)
                 },
-                "humo_auth": humo_auth
+                "humo": humo
             }
 
         except Exception as e:
@@ -504,15 +504,16 @@ async def check_bot(x_session_token: str = Header(...)):
                 "authorized": True,
                 "has_bot": False,
                 "has_messages": False,
-                "humo_auth": {
+                "humo": {
                     "is_registered": False,
                     "is_card_connected": False,
-                    "status": "bot_not_found",
-                    "current_step": 0,
-                    "next_action": "Откройте @HUMOcardbot и нажмите /start",
-                    "flags": {}
+                    "has_humo_account_for_phone": None,
+                    "can_read_transactions": False,
+                    "status": "bot_not_found_or_check_failed",
+                    "reason": str(e),
+                    "matched_signals": []
                 },
-                "message": "HUMO bot не найден в чатах пользователя"
+                "message": "HUMO bot не найден или проверка HUMO bot сломалась"
             }
 
     except HTTPException:
