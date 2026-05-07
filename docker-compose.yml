@@ -1,0 +1,17 @@
+version: "3.9"
+
+services:
+  backend:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env          # читает TELEGRAM_API_ID и TELEGRAM_API_HASH из .env файла
+    volumes:
+      - ./main.py:/app/main.py   # hot-reload: изменения в коде сразу применяются
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
