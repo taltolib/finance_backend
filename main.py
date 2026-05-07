@@ -246,214 +246,177 @@ async def verify_code(req: CodeRequest):
 
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
-def analyze_humo_auth_state(messages) -> dict:
+
+def analyze_humo_connection_state(messages) -> dict:
     """
-    Анализирует историю сообщений @HUMOcardbot и определяет,
-    прошёл ли пользователь регистрацию внутри HUMO bot.
+    Проверяет только важное:
+    1. Подключена ли карта HUMO
+    2. Есть ли HUMO/SMS-информирование на этот номер
+    3. Можно ли читать транзакции
     """
 
-    flags = {
-        "start_clicked": False,
-        "language_selected": False,
-        "agreement_seen": False,
-        "agreement_accepted": False,
-        "phone_requested": False,
-        "phone_sent": False,
-        "sms_code_requested": False,
-        "sms_code_invalid": False,
-        "registration_success": False,
-        "card_detected": False,
-    }
-
-    last_invalid_code_index = -1
-    last_sms_request_index = -1
-    last_user_code_index = -1
-    last_success_index = -1
-    last_card_index = -1
-
-    # get_messages возвращает от новых к старым, нам удобнее от старых к новым
     ordered_messages = list(reversed(messages))
 
-    for index, msg in enumerate(ordered_messages):
+    card_connected = False
+    humo_account_for_phone = None
+    sms_code_waiting = False
+    sms_code_invalid = False
+    phone_requested = False
+    no_card_or_account = False
+
+    matched_signals = []
+
+    for msg in ordered_messages:
         text = msg.text or ""
         text_lower = text.lower()
 
-        # 1. Пользователь нажал /start
-        if msg.out and "/start" in text_lower:
-            flags["start_clicked"] = True
+        # 1. Признаки подключенной карты / успешного состояния
+        card_patterns = [
+            r"\*{4}\s?\d{4}",
+            r"\b(8600|9860)\s?\*{2,}",
+            r"\b(8600|9860)\s?\d{2}\*+",
+        ]
 
-        # 2. Выбор языка
-        if "tilni tanlang" in text_lower or "выберите язык" in text_lower:
-            flags["start_clicked"] = True
+        card_words = [
+            "баланс",
+            "остаток",
+            "доступно",
+            "мои карты",
+            "карты",
+            "карта humo",
+            "uzs",
+            "сум",
+            "пополнение",
+            "списание",
+            "оплата",
+            "перевод",
+        ]
 
-        if msg.out and (
-            "русский" in text_lower
-            or "ўзбек" in text_lower
-            or "o'zbek" in text_lower
-            or "uzbek" in text_lower
-            or "🇷🇺" in text
-            or "🇺🇿" in text
-        ):
-            flags["language_selected"] = True
+        if any(re.search(pattern, text_lower) for pattern in card_patterns):
+            card_connected = True
+            humo_account_for_phone = True
+            matched_signals.append("card_mask_detected")
 
-        # 3. Соглашение / оферта
-        if (
-            "публичной оферты" in text_lower
-            or "соглашаетесь" in text_lower
-            or "ответственность за доступ" in text_lower
-        ):
-            flags["agreement_seen"] = True
+        if any(word in text_lower for word in card_words):
+            # Важно: не считаем приветственное описание бота как карту
+            if not (
+                "получать информацию по вашим humo картам" in text_lower
+                or "управлять ими напрямую" in text_lower
+                or "для пользования данным ботом" in text_lower
+            ):
+                card_connected = True
+                humo_account_for_phone = True
+                matched_signals.append("card_or_transaction_words_detected")
 
-        if msg.out and (
-            "согласен" in text_lower
-            or "✅" in text
-        ):
-            flags["agreement_accepted"] = True
+        # 2. Признаки, что карт/аккаунта нет
+        no_account_words = [
+            "на данный номер не зарегистрирован",
+            "номер не зарегистрирован",
+            "не зарегистрирован",
+            "карта не найдена",
+            "карты не найдены",
+            "нет активных карт",
+            "не найдено карт",
+            "sms-информирования не подключена",
+            "sms-информирование не подключено",
+            "услуга sms-информирования не подключена",
+            "по данному номеру не найден",
+            "по данному номеру не найдены",
+        ]
 
-        # 4. Запрос номера
+        if any(word in text_lower for word in no_account_words):
+            no_card_or_account = True
+            humo_account_for_phone = False
+            matched_signals.append("no_card_or_account_detected")
+
+        # 3. Промежуточные состояния, но только как reason
         if (
             "поделитесь своим номером" in text_lower
             or "номер должен совпадать" in text_lower
-            or "sms-информирования по карте humo" in text_lower
         ):
-            flags["phone_requested"] = True
+            phone_requested = True
+            matched_signals.append("phone_requested")
 
-        # Пользователь отправил контакт или номер
-        if msg.out:
-            has_phone_in_text = bool(re.search(r"\+998\s?\d{2}\s?\d{3}\s?\d{2}\s?\d{2}", text))
-            has_contact = getattr(msg, "contact", None) is not None
-
-            if has_phone_in_text or has_contact:
-                flags["phone_sent"] = True
-
-        # 5. SMS-код отправлен
         if (
             "sms-сообщение с кодом" in text_lower
             or "введите код" in text_lower
             or "введите 6-значный код" in text_lower
         ):
-            flags["sms_code_requested"] = True
-            last_sms_request_index = index
+            sms_code_waiting = True
+            matched_signals.append("sms_code_waiting")
 
-        # Пользователь отправил код
-        if msg.out and re.fullmatch(r"\d{4,8}", text.strip()):
-            last_user_code_index = index
-
-        # Неверный код
         if "неверный код подтверждения" in text_lower:
-            flags["sms_code_invalid"] = True
-            last_invalid_code_index = index
+            sms_code_invalid = True
+            matched_signals.append("sms_code_invalid")
 
-        # Успешная регистрация
-        if (
-            "успешно" in text_lower
-            or "активирован" in text_lower
-            or "регистрация завершена" in text_lower
-            or "добро пожаловать" in text_lower and "humocardbot" not in text_lower
-        ):
-            flags["registration_success"] = True
-            last_success_index = index
-
-        # Признаки подключенной карты
-        if (
-            "баланс" in text_lower
-            or "мои карты" in text_lower
-            or "карта" in text_lower and "humo" in text_lower
-            or re.search(r"\b(8600|9860)\s?\*{2,}", text_lower)
-            or re.search(r"\*{4}\s?\d{4}", text_lower)
-        ):
-            flags["card_detected"] = True
-            last_card_index = index
-
-    # Логика определения финального статуса
-
-    if flags["card_detected"]:
+    # Приоритет 1: если карта найдена, всё хорошо
+    if card_connected:
         return {
             "is_registered": True,
             "is_card_connected": True,
-            "status": "registered_card_connected",
-            "current_step": 6,
-            "next_action": None,
-            "flags": flags,
+            "has_humo_account_for_phone": True,
+            "can_read_transactions": True,
+            "status": "card_connected",
+            "reason": "Карта HUMO найдена в сообщениях бота",
+            "matched_signals": list(set(matched_signals)),
         }
 
-    if flags["registration_success"]:
-        return {
-            "is_registered": True,
-            "is_card_connected": False,
-            "status": "registered_no_card",
-            "current_step": 6,
-            "next_action": "Проверьте, подключена ли карта HUMO к SMS-информированию",
-            "flags": flags,
-        }
-
-    if last_invalid_code_index > last_user_code_index or flags["sms_code_invalid"]:
+    # Приоритет 2: если бот явно сказал, что карты/аккаунта нет
+    if no_card_or_account:
         return {
             "is_registered": False,
             "is_card_connected": False,
+            "has_humo_account_for_phone": False,
+            "can_read_transactions": False,
+            "status": "no_card_or_account_for_phone",
+            "reason": "HUMO bot сообщил, что карта или SMS-информирование не найдены для этого номера",
+            "matched_signals": list(set(matched_signals)),
+        }
+
+    # Приоритет 3: код неверный
+    if sms_code_invalid:
+        return {
+            "is_registered": False,
+            "is_card_connected": False,
+            "has_humo_account_for_phone": None,
+            "can_read_transactions": False,
             "status": "sms_code_invalid",
-            "current_step": 5,
-            "next_action": "Введите правильный SMS-код или запросите новый код в HUMO bot",
-            "flags": flags,
+            "reason": "Пользователь ввёл неверный SMS-код, карта ещё не подключена",
+            "matched_signals": list(set(matched_signals)),
         }
 
-    if flags["sms_code_requested"]:
+    # Приоритет 4: ждёт код
+    if sms_code_waiting:
         return {
             "is_registered": False,
             "is_card_connected": False,
+            "has_humo_account_for_phone": None,
+            "can_read_transactions": False,
             "status": "sms_code_waiting",
-            "current_step": 5,
-            "next_action": "Введите SMS-код подтверждения в HUMO bot",
-            "flags": flags,
+            "reason": "HUMO bot ждёт SMS-код, карта ещё не подключена",
+            "matched_signals": list(set(matched_signals)),
         }
 
-    if flags["phone_requested"] and not flags["phone_sent"]:
+    # Приоритет 5: просит номер
+    if phone_requested:
         return {
             "is_registered": False,
             "is_card_connected": False,
-            "status": "phone_waiting",
-            "current_step": 4,
-            "next_action": "Отправьте номер телефона в HUMO bot",
-            "flags": flags,
-        }
-
-    if flags["agreement_seen"] and not flags["agreement_accepted"]:
-        return {
-            "is_registered": False,
-            "is_card_connected": False,
-            "status": "agreement_waiting",
-            "current_step": 3,
-            "next_action": "Примите соглашение в HUMO bot",
-            "flags": flags,
-        }
-
-    if flags["start_clicked"] and not flags["language_selected"]:
-        return {
-            "is_registered": False,
-            "is_card_connected": False,
-            "status": "language_waiting",
-            "current_step": 2,
-            "next_action": "Выберите язык в HUMO bot",
-            "flags": flags,
-        }
-
-    if not flags["start_clicked"]:
-        return {
-            "is_registered": False,
-            "is_card_connected": False,
-            "status": "not_started",
-            "current_step": 1,
-            "next_action": "Нажмите /start в HUMO bot",
-            "flags": flags,
+            "has_humo_account_for_phone": None,
+            "can_read_transactions": False,
+            "status": "phone_required",
+            "reason": "HUMO bot просит отправить номер телефона",
+            "matched_signals": list(set(matched_signals)),
         }
 
     return {
         "is_registered": False,
         "is_card_connected": False,
-        "status": "unknown",
-        "current_step": None,
-        "next_action": "Не удалось точно определить этап регистрации",
-        "flags": flags,
+        "has_humo_account_for_phone": None,
+        "can_read_transactions": False,
+        "status": "not_connected_or_unknown",
+        "reason": "Карта HUMO не найдена в последних сообщениях бота",
+        "matched_signals": list(set(matched_signals)),
     }
 
 @app.get("/transactions")
