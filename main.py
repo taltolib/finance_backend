@@ -50,13 +50,26 @@ class CodeRequest(BaseModel):
 
 class Transaction(BaseModel):
     id: str
-    date: str
+    telegram_message_id: Optional[int] = None
+
+    date: str                 # "01.05.2026"
+    time: Optional[str] = None # "10:56"
+    datetime: Optional[str] = None # "2026-05-01T10:56:00"
+
     amount: float
     currency: str
-    type: str        # "expense" или "income"
-    description: str
-    raw_text: str
+    type: str                 # "income" или "expense"
 
+    title: str                # "Пополнение"
+    merchant: Optional[str] = None # "ZOOMRAD P2P HU2HU>TO"
+    card_name: Optional[str] = None # "HUMOCARD"
+    card_last4: Optional[str] = None # "7591"
+
+    balance: Optional[float] = None
+    balance_currency: Optional[str] = None
+
+    icon: Optional[str] = None
+    raw_text: str
 # Временное хранилище для phone_code_hash
 pending_logins: dict[str, dict] = {}
 
@@ -64,74 +77,191 @@ pending_logins: dict[str, dict] = {}
 # ПАРСЕР СООБЩЕНИЙ HUMO БОТА
 # ============================================================
 
-def parse_humo_message(text: str) -> Optional[Transaction]:
-    """
-    Парсит сообщение от @HUMOcardbot и извлекает транзакцию.
-    
-    Примеры сообщений от бота:
-    "Списание: 50 000 UZS\nMagазин Korzinka\n12.05.2026 14:30"
-    "Зачисление: 1 000 000 UZS\nПеревод от Алишер\n12.05.2026 10:00"
-    """
-    
-    text_lower = text.lower()
-    
-    # Определяем тип транзакции
-    is_expense = any(word in text_lower for word in [
-        'списание', 'расход', 'оплата', 'покупка', 'снятие', 'debit'
-    ])
-    is_income = any(word in text_lower for word in [
-        'зачисление', 'пополнение', 'перевод получен', 'доход', 'credit'
-    ])
-    
-    if not (is_expense or is_income):
+def parse_humo_message(text: str, message_id: Optional[int] = None) -> Optional[Transaction]:
+    if not text:
         return None
-    
-    # Извлекаем сумму (например: 50 000 UZS или 50000 UZS)
+
+    lines = [line.strip() for line in text.split("\n") if line.strip()]
+    text_lower = text.lower()
+
+    # Проверяем, похоже ли это вообще на транзакцию
+    transaction_keywords = [
+        "пополнение", "списание", "оплата", "перевод",
+        "зачисление", "снятие", "uzs", "сум", "humocard"
+    ]
+
+    if not any(word in text_lower for word in transaction_keywords):
+        return None
+
+    # Тип операции
+    income_words = ["пополнение", "зачисление", "перевод получен", "credit", "➕", "🎉"]
+    expense_words = ["списание", "оплата", "покупка", "снятие", "debit", "➖", "💸"]
+
+    is_income = any(word in text_lower or word in text for word in income_words)
+    is_expense = any(word in text_lower or word in text for word in expense_words)
+
+    if not is_income and not is_expense:
+        return None
+
+    tx_type = "income" if is_income else "expense"
+
+    # Заголовок и иконка
+    first_line = lines[0] if lines else ""
+    icon = None
+    title = first_line
+
+    icon_match = re.match(r"^([^\w\s]+)\s*(.+)$", first_line)
+    if icon_match:
+        icon = icon_match.group(1).strip()
+        title = icon_match.group(2).strip()
+
+    # Сумма операции: строка с ➕ или ➖
+    amount = None
+    currency = "UZS"
+
+    amount_line = None
+    for line in lines:
+        if "➕" in line or "➖" in line:
+            amount_line = line
+            break
+
+    if not amount_line:
+        amount_line = text
+
     amount_match = re.search(
-        r'(\d[\d\s]*\d|\d+)\s*(UZS|uzs|сум|sum)',
-        text,
+        r"([+-]?\d[\d\s.,]*)\s*(UZS|uzs|сум|sum)",
+        amount_line,
         re.IGNORECASE
     )
+
     if not amount_match:
         return None
-    
-    # Убираем пробелы из числа: "50 000" -> 50000
-    amount_str = amount_match.group(1).replace(' ', '').replace('\xa0', '')
-    try:
-        amount = float(amount_str)
-    except ValueError:
+
+    amount = parse_uzs_amount(amount_match.group(1))
+    if amount is None:
         return None
-    
-    # Извлекаем дату
-    date_match = re.search(
-        r'(\d{2}[.\-/]\d{2}[.\-/]\d{4})',
+
+    currency = amount_match.group(2).upper()
+    if currency in ["СУМ", "SUM"]:
+        currency = "UZS"
+
+    # Merchant / описание: строка с 📍
+    merchant = None
+    for line in lines:
+        if "📍" in line:
+            merchant = line.replace("📍", "").strip()
+            break
+
+    # Карта: 💳 HUMOCARD *7591
+    card_name = None
+    card_last4 = None
+
+    for line in lines:
+        if "💳" in line or "humocard" in line.lower():
+            card_line = line.replace("💳", "").strip()
+
+            card_match = re.search(r"([A-Za-zА-Яа-я0-9 ]+)\s+\*+(\d{4})", card_line)
+            if card_match:
+                card_name = card_match.group(1).strip()
+                card_last4 = card_match.group(2).strip()
+            else:
+                card_name = card_line
+            break
+
+    # Дата и время: 🕓 10:56 01.05.2026
+    time_str = None
+    date_str = None
+    datetime_str = None
+
+    datetime_match = re.search(
+        r"(\d{2}:\d{2})\s+(\d{2}[.\-/]\d{2}[.\-/]\d{4})",
         text
     )
-    date_str = date_match.group(1) if date_match else datetime.now().strftime('%d.%m.%Y')
-    
-    # Описание — берём строку после суммы или первую значимую строку
-    lines = [l.strip() for l in text.split('\n') if l.strip()]
-    description = lines[0] if lines else "Транзакция"
-    # Убираем слова-маркеры из описания
-    for marker in ['Списание:', 'Зачисление:', 'Расход:', 'Пополнение:']:
-        description = description.replace(marker, '').strip()
-    
+
+    if datetime_match:
+        time_str = datetime_match.group(1)
+        date_str = datetime_match.group(2)
+
+        try:
+            dt = datetime.strptime(
+                f"{date_str} {time_str}",
+                "%d.%m.%Y %H:%M"
+            )
+            datetime_str = dt.isoformat()
+        except ValueError:
+            datetime_str = None
+    else:
+        date_match = re.search(r"(\d{2}[.\-/]\d{2}[.\-/]\d{4})", text)
+        date_str = date_match.group(1) if date_match else datetime.now().strftime("%d.%m.%Y")
+
+    # Баланс: строка с 💰
+    balance = None
+    balance_currency = None
+
+    for line in lines:
+        if "💰" in line:
+            balance_match = re.search(
+                r"([+-]?\d[\d\s.,]*)\s*(UZS|uzs|сум|sum)",
+                line,
+                re.IGNORECASE
+            )
+            if balance_match:
+                balance = parse_uzs_amount(balance_match.group(1))
+                balance_currency = balance_match.group(2).upper()
+                if balance_currency in ["СУМ", "SUM"]:
+                    balance_currency = "UZS"
+            break
+
+    description = merchant or title or "Транзакция"
+
     import hashlib
-    tx_id = hashlib.md5(text.encode()).hexdigest()[:12]
-    
+    tx_source = f"{message_id or ''}:{text}"
+    tx_id = hashlib.md5(tx_source.encode()).hexdigest()[:12]
+
     return Transaction(
         id=tx_id,
+        telegram_message_id=message_id,
         date=date_str,
+        time=time_str,
+        datetime=datetime_str,
         amount=amount,
-        currency="UZS",
-        type="expense" if is_expense else "income",
+        currency=currency,
+        type=tx_type,
+        title=title,
         description=description,
-        raw_text=text[:200]
+        merchant=merchant,
+        card_name=card_name,
+        card_last4=card_last4,
+        balance=balance,
+        balance_currency=balance_currency,
+        icon=icon,
+        raw_text=text[:500]
     )
 
-# ============================================================
-# ENDPOINTS
-# ============================================================
+
+def parse_uzs_amount(value: str) -> Optional[float]:
+    """
+    Превращает:
+    "50.250,00" -> 50250.00
+    "1 200 000,50" -> 1200000.50
+    "50250.66" -> 50250.66
+    """
+    if not value:
+        return None
+
+    cleaned = (
+        value
+        .replace(" ", "")
+        .replace("\xa0", "")
+        .replace(".", "")
+        .replace(",", ".")
+    )
+
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
 
 @app.get("/")
 async def root():
