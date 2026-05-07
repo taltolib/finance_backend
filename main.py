@@ -162,6 +162,17 @@ async def send_code(req: PhoneRequest):
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+@app.get("/debug-env")
+async def debug_env():
+    api_hash = os.getenv("TELEGRAM_API_HASH", "")
+
+    return {
+        "api_id_exists": bool(os.getenv("TELEGRAM_API_ID")),
+        "api_id_value": os.getenv("TELEGRAM_API_ID"),
+        "api_hash_exists": bool(api_hash),
+        "api_hash_length": len(api_hash),
+        "api_hash_preview": api_hash[:4] + "***" if api_hash else None
+    }
 
 @app.post("/auth/verify-code")
 async def verify_code(req: CodeRequest):
@@ -290,13 +301,3 @@ async def check_bot(x_session_token: str = Header(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/debug-env")
-async def debug_env():
-    return {
-        "api_id_exists": bool(os.getenv("TELEGRAM_API_ID")),
-        "api_id_value": os.getenv("TELEGRAM_API_ID"),
-        "api_hash_exists": bool(os.getenv("TELEGRAM_API_HASH")),
-        "api_hash_length": len(os.getenv("TELEGRAM_API_HASH", "")),
-        "api_hash_preview": os.getenv("TELEGRAM_API_HASH", "")[:4] + "***"
-        if os.getenv("TELEGRAM_API_HASH") else None
-    }HASH") else None
