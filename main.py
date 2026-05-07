@@ -61,6 +61,7 @@ class Transaction(BaseModel):
     type: str                 # "income" или "expense"
 
     title: str                # "Пополнение"
+    description: str
     merchant: Optional[str] = None # "ZOOMRAD P2P HU2HU>TO"
     card_name: Optional[str] = None # "HUMOCARD"
     card_last4: Optional[str] = None # "7591"
@@ -240,28 +241,33 @@ def parse_humo_message(text: str, message_id: Optional[int] = None) -> Optional[
 
 
 def parse_uzs_amount(value: str) -> Optional[float]:
-    """
-    Превращает:
-    "50.250,00" -> 50250.00
-    "1 200 000,50" -> 1200000.50
-    "50250.66" -> 50250.66
-    """
     if not value:
         return None
 
-    cleaned = (
-        value
-        .replace(" ", "")
-        .replace("\xa0", "")
-        .replace(".", "")
-        .replace(",", ".")
-    )
+    cleaned = value.replace(" ", "").replace("\xa0", "")
+
+    # Формат: 50.250,00
+    if "." in cleaned and "," in cleaned:
+        cleaned = cleaned.replace(".", "").replace(",", ".")
+
+    # Формат: 50,250.00
+    elif "," in cleaned and "." in cleaned:
+        cleaned = cleaned.replace(",", "")
+
+    # Формат: 50250,00
+    elif "," in cleaned:
+        cleaned = cleaned.replace(",", ".")
+
+    # Формат: 50.250 без копеек, чаще всего это разделитель тысяч
+    elif "." in cleaned:
+        parts = cleaned.split(".")
+        if len(parts[-1]) == 3:
+            cleaned = cleaned.replace(".", "")
 
     try:
         return float(cleaned)
     except ValueError:
         return None
-
 
 @app.get("/")
 async def root():
@@ -573,7 +579,7 @@ async def get_transactions(
         transactions = []
         for msg in messages:
             if msg.text:
-                tx = parse_humo_message(msg.text)
+                tx = parse_humo_message(msg.text, msg.id)
                 if tx:
                     transactions.append(tx.dict())
         
