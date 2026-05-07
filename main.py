@@ -289,3 +289,14 @@ async def check_bot(x_session_token: str = Header(...)):
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/debug-env")
+async def debug_env():
+    return {
+        "api_id_exists": bool(os.getenv("TELEGRAM_API_ID")),
+        "api_id_value": os.getenv("TELEGRAM_API_ID"),
+        "api_hash_exists": bool(os.getenv("TELEGRAM_API_HASH")),
+        "api_hash_length": len(os.getenv("TELEGRAM_API_HASH", "")),
+        "api_hash_preview": os.getenv("TELEGRAM_API_HASH", "")[:4] + "***"
+        if os.getenv("TELEGRAM_API_HASH") else None
+    }HASH") else None
