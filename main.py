@@ -400,7 +400,6 @@ def analyze_humo_connection_state(messages) -> dict:
         text = msg.text or ""
         text_lower = text.lower()
 
-        # Старт/начатый диалог с ботом
         if (
             (msg.out and "/start" in text_lower)
             or "tilni tanlang" in text_lower
@@ -413,7 +412,7 @@ def analyze_humo_connection_state(messages) -> dict:
             has_bot_started = True
             matched_signals.append("bot_started")
 
-        # Признаки подключенной карты
+        # Признаки подключенной карты — только конкретные маски карт
         card_patterns = [
             r"\*{4}\s?\d{4}",
             r"\b(8600|9860)\s?\*{2,}",
@@ -421,33 +420,15 @@ def analyze_humo_connection_state(messages) -> dict:
             r"humocard\s+\*\d{4}",
         ]
 
-        card_words = [
-            "баланс",
-            "остаток",
-            "доступно",
-            "мои карты",
-            "карта humo",
-            "пополнение",
-            "списание",
-            "оплата",
-        ]
-
         if any(re.search(pattern, text_lower) for pattern in card_patterns):
             card_connected = True
             humo_account_for_phone = True
             matched_signals.append("card_mask_detected")
 
-        if any(word in text_lower for word in card_words):
-            if not (
-                "получать информацию по вашим humo картам" in text_lower
-                or "управлять ими напрямую" in text_lower
-                or "для пользования данным ботом" in text_lower
-            ):
-                card_connected = True
-                humo_account_for_phone = True
-                matched_signals.append("card_or_transaction_words_detected")
+        # ⚠️ Убрали широкий список card_words — он давал ложные срабатывания
+        # Слова "пополнение/списание" есть в промо-сообщениях бота
 
-        # Бот явно сказал, что карты/аккаунта нет
+        # Бот явно сказал, что карты нет — этот сигнал самый надёжный
         no_account_words = [
             "на данный номер не зарегистрирован",
             "номер не зарегистрирован",
@@ -490,19 +471,8 @@ def analyze_humo_connection_state(messages) -> dict:
             sms_code_invalid = True
             matched_signals.append("sms_code_invalid")
 
-    if card_connected:
-        return {
-            "has_bot_started": True,
-            "is_humo_registered": True,
-            "is_registered": True,
-            "is_card_connected": True,
-            "has_humo_account_for_phone": True,
-            "can_read_transactions": True,
-            "status": "card_connected",
-            "reason": "Карта HUMO найдена в сообщениях бота",
-            "matched_signals": list(set(matched_signals)),
-        }
-
+    # ✅ ИСПРАВЛЕНИЕ: no_card_or_account проверяем ДО card_connected
+    # Явный ответ бота "не зарегистрирован" надёжнее, чем эвристика по словам
     if no_card_or_account:
         return {
             "has_bot_started": has_bot_started,
@@ -513,6 +483,19 @@ def analyze_humo_connection_state(messages) -> dict:
             "can_read_transactions": False,
             "status": "no_card_or_account_for_phone",
             "reason": "HUMO bot сообщил, что карта или SMS-информирование не найдены для этого номера",
+            "matched_signals": list(set(matched_signals)),
+        }
+
+    if card_connected:
+        return {
+            "has_bot_started": True,
+            "is_humo_registered": True,
+            "is_registered": True,
+            "is_card_connected": True,
+            "has_humo_account_for_phone": True,
+            "can_read_transactions": True,
+            "status": "card_connected",
+            "reason": "Карта HUMO найдена в сообщениях бота",
             "matched_signals": list(set(matched_signals)),
         }
 
