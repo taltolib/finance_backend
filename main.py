@@ -384,15 +384,15 @@ async def verify_code(req: CodeRequest):
         raise HTTPException(status_code=400, detail=str(e))
 
 def analyze_humo_connection_state(messages) -> dict:
-    ordered_messages = list(reversed(messages))
+    ordered_messages = list(reversed(messages))  # от старых к новым
 
     has_bot_started = False
     card_connected = False
-    humo_account_for_phone = None
+    no_card_or_account = False
     sms_code_waiting = False
     sms_code_invalid = False
     phone_requested = False
-    no_card_or_account = False
+    congratulations_found = False  # ✅ НОВЫЙ ФЛАГ
 
     matched_signals = []
 
@@ -400,168 +400,157 @@ def analyze_humo_connection_state(messages) -> dict:
         text = msg.text or ""
         text_lower = text.lower()
 
+        # Старт бота
         if (
             (msg.out and "/start" in text_lower)
             or "tilni tanlang" in text_lower
             or "выберите язык" in text_lower
             or "добро пожаловать" in text_lower
             or "публичной оферты" in text_lower
-            or "поделитесь своим номером" in text_lower
-            or "номер должен совпадать" in text_lower
         ):
             has_bot_started = True
             matched_signals.append("bot_started")
 
-        # Признаки подключенной карты — только конкретные маски карт
+        # ✅ Бот прислал "Поздравляем" — регистрация завершена
+        if (
+            "поздравляем" in text_lower
+            and "подключились" in text_lower
+            and not msg.out  # это сообщение от бота, не от пользователя
+        ):
+            congratulations_found = True
+            card_connected = True
+            matched_signals.append("congratulations_detected")
+
+        # Маска карты в сообщении бота (не от пользователя)
         card_patterns = [
             r"\*{4}\s?\d{4}",
             r"\b(8600|9860)\s?\*{2,}",
-            r"\b(8600|9860)\s?\d{2}\*+",
             r"humocard\s+\*\d{4}",
+            r"humocard\s+ipakyulibank\s+\*\d{4}",
+            r"humocard\s+ao\s+anor\s+bank\s+\*\d{4}",
         ]
 
-        if any(re.search(pattern, text_lower) for pattern in card_patterns):
+        if not msg.out and any(re.search(p, text_lower) for p in card_patterns):
             card_connected = True
-            humo_account_for_phone = True
             matched_signals.append("card_mask_detected")
 
-        # ⚠️ Убрали широкий список card_words — он давал ложные срабатывания
-        # Слова "пополнение/списание" есть в промо-сообщениях бота
-
-        # Бот явно сказал, что карты нет — этот сигнал самый надёжный
+        # Бот сказал что карты нет
         no_account_words = [
             "на данный номер не зарегистрирован",
             "номер не зарегистрирован",
             "карта не найдена",
             "карты не найдены",
             "нет активных карт",
-            "не найдено карт",
             "sms-информирования не подключена",
             "sms-информирование не подключено",
             "услуга sms-информирования не подключена",
             "по данному номеру не найден",
-            "по данному номеру не найдены",
         ]
 
-        if any(word in text_lower for word in no_account_words):
-            has_bot_started = True
+        if not msg.out and any(word in text_lower for word in no_account_words):
             no_card_or_account = True
-            humo_account_for_phone = False
             matched_signals.append("no_card_or_account_detected")
 
-        if (
+        # Бот просит номер телефона
+        if not msg.out and (
             "поделитесь своим номером" in text_lower
             or "номер должен совпадать" in text_lower
         ):
-            has_bot_started = True
             phone_requested = True
             matched_signals.append("phone_requested")
 
-        if (
+        # Бот ждёт SMS-код
+        if not msg.out and (
             "sms-сообщение с кодом" in text_lower
             or "введите код" in text_lower
             or "введите 6-значный код" in text_lower
         ):
-            has_bot_started = True
             sms_code_waiting = True
             matched_signals.append("sms_code_waiting")
 
-        if "неверный код подтверждения" in text_lower:
-            has_bot_started = True
+        # Неверный код
+        if not msg.out and "неверный код подтверждения" in text_lower:
             sms_code_invalid = True
             matched_signals.append("sms_code_invalid")
 
-    # ✅ ИСПРАВЛЕНИЕ: no_card_or_account проверяем ДО card_connected
-    # Явный ответ бота "не зарегистрирован" надёжнее, чем эвристика по словам
-    if no_card_or_account:
+    unique_signals = list(set(matched_signals))
+
+    # ✅ Приоритет 1: явное "не зарегистрирован"
+    if no_card_or_account and not card_connected:
         return {
             "has_bot_started": has_bot_started,
-            "is_humo_registered": False,
             "is_registered": False,
             "is_card_connected": False,
-            "has_humo_account_for_phone": False,
             "can_read_transactions": False,
             "status": "no_card_or_account_for_phone",
-            "reason": "HUMO bot сообщил, что карта или SMS-информирование не найдены для этого номера",
-            "matched_signals": list(set(matched_signals)),
+            "reason": "HUMO bot сообщил что карта не найдена для этого номера",
+            "matched_signals": unique_signals,
         }
 
+    # ✅ Приоритет 2: карта подключена (поздравление или маска карты)
     if card_connected:
         return {
             "has_bot_started": True,
-            "is_humo_registered": True,
             "is_registered": True,
             "is_card_connected": True,
-            "has_humo_account_for_phone": True,
             "can_read_transactions": True,
             "status": "card_connected",
-            "reason": "Карта HUMO найдена в сообщениях бота",
-            "matched_signals": list(set(matched_signals)),
+            "reason": "Поздравление от HUMO bot получено — карта подключена" if congratulations_found else "Карта HUMO найдена в сообщениях",
+            "matched_signals": unique_signals,
         }
 
+    # Неверный код
     if sms_code_invalid:
         return {
             "has_bot_started": has_bot_started,
-            "is_humo_registered": False,
             "is_registered": False,
             "is_card_connected": False,
-            "has_humo_account_for_phone": None,
             "can_read_transactions": False,
             "status": "sms_code_invalid",
-            "reason": "Пользователь ввёл неверный SMS-код, карта ещё не подключена",
-            "matched_signals": list(set(matched_signals)),
+            "reason": "Неверный SMS-код",
+            "matched_signals": unique_signals,
         }
 
+    # Ждём SMS-код
     if sms_code_waiting:
         return {
             "has_bot_started": has_bot_started,
-            "is_humo_registered": False,
             "is_registered": False,
             "is_card_connected": False,
-            "has_humo_account_for_phone": None,
             "can_read_transactions": False,
             "status": "sms_code_waiting",
-            "reason": "HUMO bot ждёт SMS-код, карта ещё не подключена",
-            "matched_signals": list(set(matched_signals)),
+            "reason": "HUMO bot ждёт SMS-код",
+            "matched_signals": unique_signals,
         }
 
+    # Бот просит номер
     if phone_requested:
         return {
             "has_bot_started": has_bot_started,
-            "is_humo_registered": False,
             "is_registered": False,
             "is_card_connected": False,
-            "has_humo_account_for_phone": None,
             "can_read_transactions": False,
             "status": "phone_required",
-            "reason": "HUMO bot просит отправить номер телефона",
-            "matched_signals": list(set(matched_signals)),
+            "reason": "HUMO bot просит номер телефона",
+            "matched_signals": unique_signals,
         }
 
     return {
         "has_bot_started": has_bot_started,
-        "is_humo_registered": False,
         "is_registered": False,
         "is_card_connected": False,
-        "has_humo_account_for_phone": humo_account_for_phone,
         "can_read_transactions": False,
-        "status": "started_not_registered" if has_bot_started else "not_started_or_unknown",
-        "reason": "Диалог с HUMO bot начат, но карта не подключена" if has_bot_started else "Не удалось определить, запускал ли пользователь HUMO bot",
-        "matched_signals": list(set(matched_signals)),
+        "status": "started_not_registered" if has_bot_started else "not_started",
+        "reason": "Бот запущен но карта не подключена" if has_bot_started else "Бот не запускался",
+        "matched_signals": unique_signals,
     }
-
 @app.get("/transactions")
 async def get_transactions(
     x_session_token: str = Header(...),
     limit: int = 100
 ):
-    """Получаем транзакции только из входящих сообщений @HUMOcardbot"""
     try:
-        client = TelegramClient(
-            StringSession(x_session_token),
-            API_ID,
-            API_HASH
-        )
+        client = TelegramClient(StringSession(x_session_token), API_ID, API_HASH)
         await client.connect()
 
         if not await client.is_user_authorized():
@@ -574,18 +563,29 @@ async def get_transactions(
         transactions = []
 
         for msg in messages:
-            # Игнорируем сообщения, которые пользователь сам отправил в HUMO bot
+            # ✅ Только входящие сообщения от бота (не от пользователя)
             if msg.out:
                 continue
 
-            # Дополнительно принимаем только сообщения от HUMO bot
             if msg.sender_id and msg.sender_id != entity.id:
                 continue
 
-            if msg.text:
-                tx = parse_humo_message(msg.text, msg.id)
-                if tx:
-                    transactions.append(tx.dict())
+            if not msg.text:
+                continue
+
+            # ✅ Быстрая проверка — транзакция должна содержать эти эмодзи
+            # Формат: 🎉/💸 + ➕/➖ + 💳 + 🕓
+            text = msg.text
+            has_amount = "➕" in text or "➖" in text
+            has_card = "💳" in text
+            has_time = "🕓" in text or "🕐" in text or "🕑" in text
+
+            if not (has_amount and has_card and has_time):
+                continue  # пропускаем системные сообщения бота
+
+            tx = parse_humo_message(text, msg.id)
+            if tx:
+                transactions.append(tx.dict())
 
         await client.disconnect()
 
@@ -603,7 +603,6 @@ async def get_transactions(
 
     except HTTPException:
         raise
-
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
