@@ -578,7 +578,7 @@ async def get_transactions(
             text = msg.text
             has_amount = "➕" in text or "➖" in text
             has_card = "💳" in text
-            has_time = "🕓" in text or "🕐" in text or "🕑" in text
+            has_time = bool(re.search(r"\d{2}:\d{2}", text))
 
             if not (has_amount and has_card and has_time):
                 continue  # пропускаем системные сообщения бота
@@ -636,10 +636,8 @@ async def check_bot(x_session_token: str = Header(...)):
                 "has_messages": False,
                 "humo": {
                     "has_bot_started": False,
-                    "is_humo_registered": False,
                     "is_registered": False,
                     "is_card_connected": False,
-                    "has_humo_account_for_phone": None,
                     "can_read_transactions": False,
                     "status": "bot_not_found",
                     "reason": str(e),
