@@ -544,134 +544,74 @@ def analyze_humo_connection_state(messages) -> dict:
         "reason": "Бот запущен но карта не подключена" if has_bot_started else "Бот не запускался",
         "matched_signals": unique_signals,
     }
-@app.get("/transactions")
-async def get_transactions(
-    x_session_token: str = Header(...),
-    limit: int = 100
-):
-    try:
-        client = TelegramClient(StringSession(x_session_token), API_ID, API_HASH)
-        await client.connect()
+ @app.get("/transactions")
+ async def get_transactions(
+     x_session_token: str = Header(...),
+     limit: int = 50,          # сколько за раз
+     offset_id: int = 0        # ID последнего сообщения (для следующей страницы)
+ ):
+     try:
+         client = TelegramClient(StringSession(x_session_token), API_ID, API_HASH)
+         await client.connect()
 
-        if not await client.is_user_authorized():
-            await client.disconnect()
-            raise HTTPException(status_code=401, detail="Сессия истекла")
+         if not await client.is_user_authorized():
+             await client.disconnect()
+             raise HTTPException(status_code=401, detail="Сессия истекла")
 
-        entity = await client.get_entity("@HUMOcardbot")
-        messages = await client.get_messages(entity, limit=limit)
+         entity = await client.get_entity("@HUMOcardbot")
 
-        transactions = []
+         # offset_id = 0 означает "с самого последнего"
+         # offset_id = 500 означает "начиная с сообщения ID 500 и старше"
+         messages = await client.get_messages(
+             entity,
+             limit=limit,
+             offset_id=offset_id
+         )
 
-        for msg in messages:
-            # ✅ Только входящие сообщения от бота (не от пользователя)
-            if msg.out:
-                continue
+         transactions = []
+         last_message_id = None
 
-            if msg.sender_id and msg.sender_id != entity.id:
-                continue
+         for msg in messages:
+             if msg.out:
+                 continue
+             if msg.sender_id and msg.sender_id != entity.id:
+                 continue
+             if not msg.text:
+                 continue
 
-            if not msg.text:
-                continue
+             text = msg.text
+             has_amount = "➕" in text or "➖" in text
+             has_card = "💳" in text
+             has_time = bool(re.search(r"\d{2}:\d{2}", text))
 
-            # ✅ Быстрая проверка — транзакция должна содержать эти эмодзи
-            # Формат: 🎉/💸 + ➕/➖ + 💳 + 🕓
-            text = msg.text
-            has_amount = "➕" in text or "➖" in text
-            has_card = "💳" in text
-            has_time = bool(re.search(r"\d{2}:\d{2}", text))
+             if not (has_amount and has_card and has_time):
+                 continue
 
-            if not (has_amount and has_card and has_time):
-                continue  # пропускаем системные сообщения бота
+             tx = parse_humo_message(text, msg.id)
+             if tx:
+                 transactions.append(tx.dict())
+                 last_message_id = msg.id  # запоминаем ID последнего
 
-            tx = parse_humo_message(text, msg.id)
-            if tx:
-                transactions.append(tx.dict())
+         await client.disconnect()
 
-        await client.disconnect()
+         income_total = sum(t["amount"] for t in transactions if t["type"] == "income")
+         expense_total = sum(t["amount"] for t in transactions if t["type"] == "expense")
 
-        income_total = sum(tx["amount"] for tx in transactions if tx["type"] == "income")
-        expense_total = sum(tx["amount"] for tx in transactions if tx["type"] == "expense")
+         return {
+             "success": True,
+             "count": len(transactions),
+             "income_total": income_total,
+             "expense_total": expense_total,
+             "currency": "UZS",
+             "has_more": len(messages) == limit,  # есть ли ещё страницы
+             "next_offset_id": last_message_id,    # Flutter передаст это для следующей страницы
+             "transactions": transactions
+         }
 
-        return {
-            "success": True,
-            "count": len(transactions),
-            "income_total": income_total,
-            "expense_total": expense_total,
-            "currency": "UZS",
-            "transactions": transactions
-        }
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/check-bot")
-async def check_bot(x_session_token: str = Header(...)):
-    """Проверяем Telegram-сессию, наличие HUMO bot и подключена ли карта"""
-    client = None
-
-    try:
-        client = TelegramClient(
-            StringSession(x_session_token),
-            API_ID,
-            API_HASH
-        )
-        await client.connect()
-
-        if not await client.is_user_authorized():
-            raise HTTPException(
-                status_code=401,
-                detail="SESSION_EXPIRED"
-            )
-
-        try:
-            entity = await client.get_entity("@HUMOcardbot")
-        except Exception as e:
-            return {
-                "success": True,
-                "authorized": True,
-                "has_bot": False,
-                "has_messages": False,
-                "humo": {
-                    "has_bot_started": False,
-                    "is_registered": False,
-                    "is_card_connected": False,
-                    "can_read_transactions": False,
-                    "status": "bot_not_found",
-                    "reason": str(e),
-                    "matched_signals": []
-                },
-                "message": "HUMO bot не найден в чатах пользователя"
-            }
-
-        messages = await client.get_messages(entity, limit=100)
-        has_messages = len(messages) > 0
-        humo = analyze_humo_connection_state(messages)
-
-        return {
-            "success": True,
-            "authorized": True,
-            "has_bot": True,
-            "has_messages": has_messages,
-            "bot": {
-                "id": entity.id,
-                "username": getattr(entity, "username", None),
-                "title": getattr(entity, "first_name", None)
-            },
-            "humo": humo
-        }
-
-    except HTTPException:
-        raise
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-    finally:
-        if client:
-            await client.disconnect()
+     except HTTPException:
+         raise
+     except Exception as e:
+         raise HTTPException(status_code=500, detail=str(e))
 
 
       @app.get("/auth/me")
