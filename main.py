@@ -672,3 +672,49 @@ async def check_bot(x_session_token: str = Header(...)):
     finally:
         if client:
             await client.disconnect()
+
+
+      @app.get("/auth/me")
+      async def get_me(x_session_token: str = Header(...)):
+          """При старте приложения — проверяем токен и отдаём данные юзера"""
+          client = None
+          try:
+              client = TelegramClient(
+                  StringSession(x_session_token),
+                  API_ID,
+                  API_HASH
+              )
+              await client.connect()
+
+              if not await client.is_user_authorized():
+                  raise HTTPException(status_code=401, detail="SESSION_EXPIRED")
+
+              me = await client.get_me()
+
+              photo_base64 = None
+              try:
+                  photo_bytes = await client.download_profile_photo(me, file=bytes)
+                  if photo_bytes:
+                      photo_base64 = base64.b64encode(photo_bytes).decode("utf-8")
+              except Exception:
+                  pass
+
+              return {
+                  "success": True,
+                  "user": {
+                      "id": me.id,
+                      "name": f"{me.first_name or ''} {me.last_name or ''}".strip(),
+                      "first_name": me.first_name or "",
+                      "last_name": me.last_name or "",
+                      "username": me.username,
+                      "photo_base64": photo_base64,
+                  }
+              }
+
+          except HTTPException:
+              raise
+          except Exception as e:
+              raise HTTPException(status_code=500, detail=str(e))
+          finally:
+              if client:
+                  await client.disconnect()
