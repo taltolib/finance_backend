@@ -11,13 +11,11 @@ from pydantic import BaseModel
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 import re
-import json
 import os
 import base64
-import io
+import hashlib
 from datetime import datetime
 from typing import Optional
-import asyncio
 
 app = FastAPI(title="Finance App API")
 
@@ -28,19 +26,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# === КОНФИГИ — заполни своими данными из my.telegram.org ===
 API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
 API_HASH = os.getenv("TELEGRAM_API_HASH", "")
 
-# Хранилище сессий пользователей (в проде используй БД)
 user_sessions: dict[str, str] = {}
+pending_logins: dict[str, dict] = {}
 
 # ============================================================
 # МОДЕЛИ
 # ============================================================
 
 class PhoneRequest(BaseModel):
-    phone: str  # "+998901234567"
+    phone: str
 
 class CodeRequest(BaseModel):
     phone: str
@@ -51,32 +48,45 @@ class CodeRequest(BaseModel):
 class Transaction(BaseModel):
     id: str
     telegram_message_id: Optional[int] = None
-
-    date: str                 # "01.05.2026"
-    time: Optional[str] = None # "10:56"
-    datetime: Optional[str] = None # "2026-05-01T10:56:00"
-
+    date: str
+    time: Optional[str] = None
+    datetime: Optional[str] = None
     amount: float
     currency: str
-    type: str                 # "income" или "expense"
-
-    title: str                # "Пополнение"
+    type: str
+    title: str
     description: str
-    merchant: Optional[str] = None # "ZOOMRAD P2P HU2HU>TO"
-    card_name: Optional[str] = None # "HUMOCARD"
-    card_last4: Optional[str] = None # "7591"
-
+    merchant: Optional[str] = None
+    card_name: Optional[str] = None
+    card_last4: Optional[str] = None
     balance: Optional[float] = None
     balance_currency: Optional[str] = None
-
     icon: Optional[str] = None
     raw_text: str
-# Временное хранилище для phone_code_hash
-pending_logins: dict[str, dict] = {}
 
 # ============================================================
 # ПАРСЕР СООБЩЕНИЙ HUMO БОТА
 # ============================================================
+
+def parse_uzs_amount(value: str) -> Optional[float]:
+    if not value:
+        return None
+    cleaned = value.replace(" ", "").replace("\xa0", "")
+    if "." in cleaned and "," in cleaned:
+        cleaned = cleaned.replace(".", "").replace(",", ".")
+    elif "," in cleaned and "." in cleaned:
+        cleaned = cleaned.replace(",", "")
+    elif "," in cleaned:
+        cleaned = cleaned.replace(",", ".")
+    elif "." in cleaned:
+        parts = cleaned.split(".")
+        if len(parts[-1]) == 3:
+            cleaned = cleaned.replace(".", "")
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
 
 def parse_humo_message(text: str, message_id: Optional[int] = None) -> Optional[Transaction]:
     if not text:
@@ -85,16 +95,13 @@ def parse_humo_message(text: str, message_id: Optional[int] = None) -> Optional[
     lines = [line.strip() for line in text.split("\n") if line.strip()]
     text_lower = text.lower()
 
-    # Проверяем, похоже ли это вообще на транзакцию
     transaction_keywords = [
         "пополнение", "списание", "оплата", "перевод",
         "зачисление", "снятие", "uzs", "сум", "humocard"
     ]
-
     if not any(word in text_lower for word in transaction_keywords):
         return None
 
-    # Тип операции
     income_words = ["пополнение", "зачисление", "перевод получен", "credit", "➕", "🎉"]
     expense_words = ["списание", "оплата", "покупка", "снятие", "debit", "➖", "💸"]
 
@@ -106,7 +113,6 @@ def parse_humo_message(text: str, message_id: Optional[int] = None) -> Optional[
 
     tx_type = "income" if is_income else "expense"
 
-    # Заголовок и иконка
     first_line = lines[0] if lines else ""
     icon = None
     title = first_line
@@ -116,11 +122,10 @@ def parse_humo_message(text: str, message_id: Optional[int] = None) -> Optional[
         icon = icon_match.group(1).strip()
         title = icon_match.group(2).strip()
 
-    # Сумма операции: строка с ➕ или ➖
     amount = None
     currency = "UZS"
-
     amount_line = None
+
     for line in lines:
         if "➕" in line or "➖" in line:
             amount_line = line
@@ -134,7 +139,6 @@ def parse_humo_message(text: str, message_id: Optional[int] = None) -> Optional[
         amount_line,
         re.IGNORECASE
     )
-
     if not amount_match:
         return None
 
@@ -146,21 +150,17 @@ def parse_humo_message(text: str, message_id: Optional[int] = None) -> Optional[
     if currency in ["СУМ", "SUM"]:
         currency = "UZS"
 
-    # Merchant / описание: строка с 📍
     merchant = None
     for line in lines:
         if "📍" in line:
             merchant = line.replace("📍", "").strip()
             break
 
-    # Карта: 💳 HUMOCARD *7591
     card_name = None
     card_last4 = None
-
     for line in lines:
         if "💳" in line or "humocard" in line.lower():
             card_line = line.replace("💳", "").strip()
-
             card_match = re.search(r"([A-Za-zА-Яа-я0-9 ]+)\s+\*+(\d{4})", card_line)
             if card_match:
                 card_name = card_match.group(1).strip()
@@ -169,7 +169,6 @@ def parse_humo_message(text: str, message_id: Optional[int] = None) -> Optional[
                 card_name = card_line
             break
 
-    # Дата и время: 🕓 10:56 01.05.2026
     time_str = None
     date_str = None
     datetime_str = None
@@ -178,16 +177,11 @@ def parse_humo_message(text: str, message_id: Optional[int] = None) -> Optional[
         r"(\d{2}:\d{2})\s+(\d{2}[.\-/]\d{2}[.\-/]\d{4})",
         text
     )
-
     if datetime_match:
         time_str = datetime_match.group(1)
         date_str = datetime_match.group(2)
-
         try:
-            dt = datetime.strptime(
-                f"{date_str} {time_str}",
-                "%d.%m.%Y %H:%M"
-            )
+            dt = datetime.strptime(f"{date_str} {time_str}", "%d.%m.%Y %H:%M")
             datetime_str = dt.isoformat()
         except ValueError:
             datetime_str = None
@@ -195,10 +189,8 @@ def parse_humo_message(text: str, message_id: Optional[int] = None) -> Optional[
         date_match = re.search(r"(\d{2}[.\-/]\d{2}[.\-/]\d{4})", text)
         date_str = date_match.group(1) if date_match else datetime.now().strftime("%d.%m.%Y")
 
-    # Баланс: строка с 💰
     balance = None
     balance_currency = None
-
     for line in lines:
         if "💰" in line:
             balance_match = re.search(
@@ -214,8 +206,6 @@ def parse_humo_message(text: str, message_id: Optional[int] = None) -> Optional[
             break
 
     description = merchant or title or "Транзакция"
-
-    import hashlib
     tx_source = f"{message_id or ''}:{text}"
     tx_id = hashlib.md5(tx_source.encode()).hexdigest()[:12]
 
@@ -240,38 +230,178 @@ def parse_humo_message(text: str, message_id: Optional[int] = None) -> Optional[
     )
 
 
-def parse_uzs_amount(value: str) -> Optional[float]:
-    if not value:
-        return None
+# ============================================================
+# АНАЛИЗ СОСТОЯНИЯ HUMO БОТА
+# ============================================================
 
-    cleaned = value.replace(" ", "").replace("\xa0", "")
+def analyze_humo_connection_state(messages) -> dict:
+    ordered_messages = list(reversed(messages))
 
-    # Формат: 50.250,00
-    if "." in cleaned and "," in cleaned:
-        cleaned = cleaned.replace(".", "").replace(",", ".")
+    has_bot_started = False
+    card_connected = False
+    no_card_or_account = False
+    sms_code_waiting = False
+    sms_code_invalid = False
+    phone_requested = False
+    congratulations_found = False
 
-    # Формат: 50,250.00
-    elif "," in cleaned and "." in cleaned:
-        cleaned = cleaned.replace(",", "")
+    matched_signals = []
 
-    # Формат: 50250,00
-    elif "," in cleaned:
-        cleaned = cleaned.replace(",", ".")
+    for msg in ordered_messages:
+        text = msg.text or ""
+        text_lower = text.lower()
 
-    # Формат: 50.250 без копеек, чаще всего это разделитель тысяч
-    elif "." in cleaned:
-        parts = cleaned.split(".")
-        if len(parts[-1]) == 3:
-            cleaned = cleaned.replace(".", "")
+        if (
+            (msg.out and "/start" in text_lower)
+            or "tilni tanlang" in text_lower
+            or "выберите язык" in text_lower
+            or "добро пожаловать" in text_lower
+            or "публичной оферты" in text_lower
+        ):
+            has_bot_started = True
+            matched_signals.append("bot_started")
 
-    try:
-        return float(cleaned)
-    except ValueError:
-        return None
+        if (
+            "поздравляем" in text_lower
+            and "подключились" in text_lower
+            and not msg.out
+        ):
+            congratulations_found = True
+            card_connected = True
+            matched_signals.append("congratulations_detected")
+
+        card_patterns = [
+            r"\*{4}\s?\d{4}",
+            r"\b(8600|9860)\s?\*{2,}",
+            r"humocard\s+\*\d{4}",
+            r"humocard\s+ipakyulibank\s+\*\d{4}",
+            r"humocard\s+ao\s+anor\s+bank\s+\*\d{4}",
+        ]
+        if not msg.out and any(re.search(p, text_lower) for p in card_patterns):
+            card_connected = True
+            matched_signals.append("card_mask_detected")
+
+        no_account_words = [
+            "на данный номер не зарегистрирован",
+            "номер не зарегистрирован",
+            "карта не найдена",
+            "карты не найдены",
+            "нет активных карт",
+            "sms-информирования не подключена",
+            "sms-информирование не подключено",
+            "услуга sms-информирования не подключена",
+            "по данному номеру не найден",
+        ]
+        if not msg.out and any(word in text_lower for word in no_account_words):
+            no_card_or_account = True
+            matched_signals.append("no_card_or_account_detected")
+
+        if not msg.out and (
+            "поделитесь своим номером" in text_lower
+            or "номер должен совпадать" in text_lower
+        ):
+            phone_requested = True
+            matched_signals.append("phone_requested")
+
+        if not msg.out and (
+            "sms-сообщение с кодом" in text_lower
+            or "введите код" in text_lower
+            or "введите 6-значный код" in text_lower
+        ):
+            sms_code_waiting = True
+            matched_signals.append("sms_code_waiting")
+
+        if not msg.out and "неверный код подтверждения" in text_lower:
+            sms_code_invalid = True
+            matched_signals.append("sms_code_invalid")
+
+    unique_signals = list(set(matched_signals))
+
+    if no_card_or_account and not card_connected:
+        return {
+            "has_bot_started": has_bot_started,
+            "is_registered": False,
+            "is_card_connected": False,
+            "can_read_transactions": False,
+            "status": "no_card_or_account_for_phone",
+            "reason": "HUMO bot сообщил что карта не найдена для этого номера",
+            "matched_signals": unique_signals,
+        }
+
+    if card_connected:
+        return {
+            "has_bot_started": True,
+            "is_registered": True,
+            "is_card_connected": True,
+            "can_read_transactions": True,
+            "status": "card_connected",
+            "reason": "Поздравление от HUMO bot получено — карта подключена" if congratulations_found else "Карта HUMO найдена в сообщениях",
+            "matched_signals": unique_signals,
+        }
+
+    if sms_code_invalid:
+        return {
+            "has_bot_started": has_bot_started,
+            "is_registered": False,
+            "is_card_connected": False,
+            "can_read_transactions": False,
+            "status": "sms_code_invalid",
+            "reason": "Неверный SMS-код",
+            "matched_signals": unique_signals,
+        }
+
+    if sms_code_waiting:
+        return {
+            "has_bot_started": has_bot_started,
+            "is_registered": False,
+            "is_card_connected": False,
+            "can_read_transactions": False,
+            "status": "sms_code_waiting",
+            "reason": "HUMO bot ждёт SMS-код",
+            "matched_signals": unique_signals,
+        }
+
+    if phone_requested:
+        return {
+            "has_bot_started": has_bot_started,
+            "is_registered": False,
+            "is_card_connected": False,
+            "can_read_transactions": False,
+            "status": "phone_required",
+            "reason": "HUMO bot просит номер телефона",
+            "matched_signals": unique_signals,
+        }
+
+    return {
+        "has_bot_started": has_bot_started,
+        "is_registered": False,
+        "is_card_connected": False,
+        "can_read_transactions": False,
+        "status": "started_not_registered" if has_bot_started else "not_started",
+        "reason": "Бот запущен но карта не подключена" if has_bot_started else "Бот не запускался",
+        "matched_signals": unique_signals,
+    }
+
+
+# ============================================================
+# ЭНДПОИНТЫ
+# ============================================================
 
 @app.get("/")
 async def root():
     return {"status": "ok", "message": "Finance App API работает"}
+
+
+@app.get("/debug-env")
+async def debug_env():
+    api_hash = os.getenv("TELEGRAM_API_HASH", "")
+    return {
+        "api_id_exists": bool(os.getenv("TELEGRAM_API_ID")),
+        "api_id_value": os.getenv("TELEGRAM_API_ID"),
+        "api_hash_exists": bool(api_hash),
+        "api_hash_length": len(api_hash),
+        "api_hash_preview": api_hash[:4] + "***" if api_hash else None
+    }
 
 
 @app.post("/auth/send-code")
@@ -280,18 +410,13 @@ async def send_code(req: PhoneRequest):
     try:
         client = TelegramClient(StringSession(), API_ID, API_HASH)
         await client.connect()
-        
         result = await client.send_code_request(req.phone)
-        
-        # Сохраняем client и hash для следующего шага
         session_string = client.session.save()
         pending_logins[req.phone] = {
             "session": session_string,
             "phone_code_hash": result.phone_code_hash
         }
-        
         await client.disconnect()
-        
         return {
             "success": True,
             "phone_code_hash": result.phone_code_hash,
@@ -300,17 +425,6 @@ async def send_code(req: PhoneRequest):
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-@app.get("/debug-env")
-async def debug_env():
-    api_hash = os.getenv("TELEGRAM_API_HASH", "")
-
-    return {
-        "api_id_exists": bool(os.getenv("TELEGRAM_API_ID")),
-        "api_id_value": os.getenv("TELEGRAM_API_ID"),
-        "api_hash_exists": bool(api_hash),
-        "api_hash_length": len(api_hash),
-        "api_hash_preview": api_hash[:4] + "***" if api_hash else None
-    }
 
 @app.post("/auth/verify-code")
 async def verify_code(req: CodeRequest):
@@ -333,32 +447,23 @@ async def verify_code(req: CodeRequest):
                 code=req.code,
                 phone_code_hash=req.phone_code_hash
             )
-
         except SessionPasswordNeededError:
             if not req.password:
                 await client.disconnect()
-                raise HTTPException(
-                    status_code=401,
-                    detail="TWO_STEP_PASSWORD_REQUIRED"
-                )
-
+                raise HTTPException(status_code=401, detail="TWO_STEP_PASSWORD_REQUIRED")
             await client.sign_in(password=req.password)
 
-        # Сохраняем финальную сессию
         session_string = client.session.save()
         user_sessions[req.phone] = session_string
-
-        # Получаем инфо о пользователе
         me = await client.get_me()
 
-        # Скачиваем фото профиля в память
         photo_base64 = None
         try:
             photo_bytes = await client.download_profile_photo(me, file=bytes)
             if photo_bytes:
                 photo_base64 = base64.b64encode(photo_bytes).decode("utf-8")
         except Exception:
-            photo_base64 = None
+            pass
 
         await client.disconnect()
         del pending_logins[req.phone]
@@ -379,282 +484,193 @@ async def verify_code(req: CodeRequest):
 
     except HTTPException:
         raise
-
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-def analyze_humo_connection_state(messages) -> dict:
-    ordered_messages = list(reversed(messages))  # от старых к новым
 
-    has_bot_started = False
-    card_connected = False
-    no_card_or_account = False
-    sms_code_waiting = False
-    sms_code_invalid = False
-    phone_requested = False
-    congratulations_found = False  # ✅ НОВЫЙ ФЛАГ
+@app.get("/auth/me")
+async def get_me(x_session_token: str = Header(...)):
+    """При старте приложения — проверяем токен и отдаём данные юзера"""
+    client = None
+    try:
+        client = TelegramClient(StringSession(x_session_token), API_ID, API_HASH)
+        await client.connect()
 
-    matched_signals = []
+        if not await client.is_user_authorized():
+            raise HTTPException(status_code=401, detail="SESSION_EXPIRED")
 
-    for msg in ordered_messages:
-        text = msg.text or ""
-        text_lower = text.lower()
+        me = await client.get_me()
 
-        # Старт бота
-        if (
-            (msg.out and "/start" in text_lower)
-            or "tilni tanlang" in text_lower
-            or "выберите язык" in text_lower
-            or "добро пожаловать" in text_lower
-            or "публичной оферты" in text_lower
-        ):
-            has_bot_started = True
-            matched_signals.append("bot_started")
+        photo_base64 = None
+        try:
+            photo_bytes = await client.download_profile_photo(me, file=bytes)
+            if photo_bytes:
+                photo_base64 = base64.b64encode(photo_bytes).decode("utf-8")
+        except Exception:
+            pass
 
-        # ✅ Бот прислал "Поздравляем" — регистрация завершена
-        if (
-            "поздравляем" in text_lower
-            and "подключились" in text_lower
-            and not msg.out  # это сообщение от бота, не от пользователя
-        ):
-            congratulations_found = True
-            card_connected = True
-            matched_signals.append("congratulations_detected")
-
-        # Маска карты в сообщении бота (не от пользователя)
-        card_patterns = [
-            r"\*{4}\s?\d{4}",
-            r"\b(8600|9860)\s?\*{2,}",
-            r"humocard\s+\*\d{4}",
-            r"humocard\s+ipakyulibank\s+\*\d{4}",
-            r"humocard\s+ao\s+anor\s+bank\s+\*\d{4}",
-        ]
-
-        if not msg.out and any(re.search(p, text_lower) for p in card_patterns):
-            card_connected = True
-            matched_signals.append("card_mask_detected")
-
-        # Бот сказал что карты нет
-        no_account_words = [
-            "на данный номер не зарегистрирован",
-            "номер не зарегистрирован",
-            "карта не найдена",
-            "карты не найдены",
-            "нет активных карт",
-            "sms-информирования не подключена",
-            "sms-информирование не подключено",
-            "услуга sms-информирования не подключена",
-            "по данному номеру не найден",
-        ]
-
-        if not msg.out and any(word in text_lower for word in no_account_words):
-            no_card_or_account = True
-            matched_signals.append("no_card_or_account_detected")
-
-        # Бот просит номер телефона
-        if not msg.out and (
-            "поделитесь своим номером" in text_lower
-            or "номер должен совпадать" in text_lower
-        ):
-            phone_requested = True
-            matched_signals.append("phone_requested")
-
-        # Бот ждёт SMS-код
-        if not msg.out and (
-            "sms-сообщение с кодом" in text_lower
-            or "введите код" in text_lower
-            or "введите 6-значный код" in text_lower
-        ):
-            sms_code_waiting = True
-            matched_signals.append("sms_code_waiting")
-
-        # Неверный код
-        if not msg.out and "неверный код подтверждения" in text_lower:
-            sms_code_invalid = True
-            matched_signals.append("sms_code_invalid")
-
-    unique_signals = list(set(matched_signals))
-
-    # ✅ Приоритет 1: явное "не зарегистрирован"
-    if no_card_or_account and not card_connected:
         return {
-            "has_bot_started": has_bot_started,
-            "is_registered": False,
-            "is_card_connected": False,
-            "can_read_transactions": False,
-            "status": "no_card_or_account_for_phone",
-            "reason": "HUMO bot сообщил что карта не найдена для этого номера",
-            "matched_signals": unique_signals,
+            "success": True,
+            "user": {
+                "id": me.id,
+                "name": f"{me.first_name or ''} {me.last_name or ''}".strip(),
+                "first_name": me.first_name or "",
+                "last_name": me.last_name or "",
+                "username": me.username,
+                "photo_base64": photo_base64,
+            }
         }
 
-    # ✅ Приоритет 2: карта подключена (поздравление или маска карты)
-    if card_connected:
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if client:
+            await client.disconnect()
+
+
+@app.post("/auth/logout")
+async def logout(x_session_token: str = Header(...)):
+    """Выход из аккаунта"""
+    client = None
+    try:
+        client = TelegramClient(StringSession(x_session_token), API_ID, API_HASH)
+        await client.connect()
+        if await client.is_user_authorized():
+            await client.log_out()
+        return {"success": True, "message": "Вы вышли из аккаунта"}
+    except Exception:
+        return {"success": True, "message": "Сессия завершена"}
+    finally:
+        if client:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+
+
+@app.get("/check-bot")
+async def check_bot(x_session_token: str = Header(...)):
+    """Проверяем Telegram-сессию, наличие HUMO bot и подключена ли карта"""
+    client = None
+    try:
+        client = TelegramClient(StringSession(x_session_token), API_ID, API_HASH)
+        await client.connect()
+
+        if not await client.is_user_authorized():
+            raise HTTPException(status_code=401, detail="SESSION_EXPIRED")
+
+        try:
+            entity = await client.get_entity("@HUMOcardbot")
+        except Exception as e:
+            return {
+                "success": True,
+                "authorized": True,
+                "has_bot": False,
+                "has_messages": False,
+                "humo": {
+                    "has_bot_started": False,
+                    "is_registered": False,
+                    "is_card_connected": False,
+                    "can_read_transactions": False,
+                    "status": "bot_not_found",
+                    "reason": str(e),
+                    "matched_signals": []
+                },
+                "message": "HUMO bot не найден в чатах пользователя"
+            }
+
+        messages = await client.get_messages(entity, limit=100)
+        has_messages = len(messages) > 0
+        humo = analyze_humo_connection_state(messages)
+
         return {
-            "has_bot_started": True,
-            "is_registered": True,
-            "is_card_connected": True,
-            "can_read_transactions": True,
-            "status": "card_connected",
-            "reason": "Поздравление от HUMO bot получено — карта подключена" if congratulations_found else "Карта HUMO найдена в сообщениях",
-            "matched_signals": unique_signals,
+            "success": True,
+            "authorized": True,
+            "has_bot": True,
+            "has_messages": has_messages,
+            "bot": {
+                "id": entity.id,
+                "username": getattr(entity, "username", None),
+                "title": getattr(entity, "first_name", None)
+            },
+            "humo": humo
         }
 
-    # Неверный код
-    if sms_code_invalid:
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if client:
+            await client.disconnect()
+
+
+@app.get("/transactions")
+async def get_transactions(
+    x_session_token: str = Header(...),
+    limit: int = 50,
+    offset_id: int = 0
+):
+    """Получаем транзакции из @HUMOcardbot с пагинацией"""
+    client = None
+    try:
+        client = TelegramClient(StringSession(x_session_token), API_ID, API_HASH)
+        await client.connect()
+
+        if not await client.is_user_authorized():
+            raise HTTPException(status_code=401, detail="Сессия истекла")
+
+        entity = await client.get_entity("@HUMOcardbot")
+        messages = await client.get_messages(
+            entity,
+            limit=limit,
+            offset_id=offset_id
+        )
+
+        transactions = []
+        last_message_id = None
+
+        for msg in messages:
+            if msg.out:
+                continue
+            if msg.sender_id and msg.sender_id != entity.id:
+                continue
+            if not msg.text:
+                continue
+
+            text = msg.text
+            has_amount = "➕" in text or "➖" in text
+            has_card = "💳" in text
+            has_time = bool(re.search(r"\d{2}:\d{2}", text))
+
+            if not (has_amount and has_card and has_time):
+                continue
+
+            tx = parse_humo_message(text, msg.id)
+            if tx:
+                transactions.append(tx.dict())
+                last_message_id = msg.id
+
+        income_total = sum(t["amount"] for t in transactions if t["type"] == "income")
+        expense_total = sum(t["amount"] for t in transactions if t["type"] == "expense")
+
         return {
-            "has_bot_started": has_bot_started,
-            "is_registered": False,
-            "is_card_connected": False,
-            "can_read_transactions": False,
-            "status": "sms_code_invalid",
-            "reason": "Неверный SMS-код",
-            "matched_signals": unique_signals,
+            "success": True,
+            "count": len(transactions),
+            "income_total": income_total,
+            "expense_total": expense_total,
+            "currency": "UZS",
+            "has_more": len(messages) == limit,
+            "next_offset_id": last_message_id,
+            "transactions": transactions
         }
 
-    # Ждём SMS-код
-    if sms_code_waiting:
-        return {
-            "has_bot_started": has_bot_started,
-            "is_registered": False,
-            "is_card_connected": False,
-            "can_read_transactions": False,
-            "status": "sms_code_waiting",
-            "reason": "HUMO bot ждёт SMS-код",
-            "matched_signals": unique_signals,
-        }
-
-    # Бот просит номер
-    if phone_requested:
-        return {
-            "has_bot_started": has_bot_started,
-            "is_registered": False,
-            "is_card_connected": False,
-            "can_read_transactions": False,
-            "status": "phone_required",
-            "reason": "HUMO bot просит номер телефона",
-            "matched_signals": unique_signals,
-        }
-
-    return {
-        "has_bot_started": has_bot_started,
-        "is_registered": False,
-        "is_card_connected": False,
-        "can_read_transactions": False,
-        "status": "started_not_registered" if has_bot_started else "not_started",
-        "reason": "Бот запущен но карта не подключена" if has_bot_started else "Бот не запускался",
-        "matched_signals": unique_signals,
-    }
- @app.get("/transactions")
- async def get_transactions(
-     x_session_token: str = Header(...),
-     limit: int = 50,          # сколько за раз
-     offset_id: int = 0        # ID последнего сообщения (для следующей страницы)
- ):
-     try:
-         client = TelegramClient(StringSession(x_session_token), API_ID, API_HASH)
-         await client.connect()
-
-         if not await client.is_user_authorized():
-             await client.disconnect()
-             raise HTTPException(status_code=401, detail="Сессия истекла")
-
-         entity = await client.get_entity("@HUMOcardbot")
-
-         # offset_id = 0 означает "с самого последнего"
-         # offset_id = 500 означает "начиная с сообщения ID 500 и старше"
-         messages = await client.get_messages(
-             entity,
-             limit=limit,
-             offset_id=offset_id
-         )
-
-         transactions = []
-         last_message_id = None
-
-         for msg in messages:
-             if msg.out:
-                 continue
-             if msg.sender_id and msg.sender_id != entity.id:
-                 continue
-             if not msg.text:
-                 continue
-
-             text = msg.text
-             has_amount = "➕" in text or "➖" in text
-             has_card = "💳" in text
-             has_time = bool(re.search(r"\d{2}:\d{2}", text))
-
-             if not (has_amount and has_card and has_time):
-                 continue
-
-             tx = parse_humo_message(text, msg.id)
-             if tx:
-                 transactions.append(tx.dict())
-                 last_message_id = msg.id  # запоминаем ID последнего
-
-         await client.disconnect()
-
-         income_total = sum(t["amount"] for t in transactions if t["type"] == "income")
-         expense_total = sum(t["amount"] for t in transactions if t["type"] == "expense")
-
-         return {
-             "success": True,
-             "count": len(transactions),
-             "income_total": income_total,
-             "expense_total": expense_total,
-             "currency": "UZS",
-             "has_more": len(messages) == limit,  # есть ли ещё страницы
-             "next_offset_id": last_message_id,    # Flutter передаст это для следующей страницы
-             "transactions": transactions
-         }
-
-     except HTTPException:
-         raise
-     except Exception as e:
-         raise HTTPException(status_code=500, detail=str(e))
-
-
-      @app.get("/auth/me")
-      async def get_me(x_session_token: str = Header(...)):
-          """При старте приложения — проверяем токен и отдаём данные юзера"""
-          client = None
-          try:
-              client = TelegramClient(
-                  StringSession(x_session_token),
-                  API_ID,
-                  API_HASH
-              )
-              await client.connect()
-
-              if not await client.is_user_authorized():
-                  raise HTTPException(status_code=401, detail="SESSION_EXPIRED")
-
-              me = await client.get_me()
-
-              photo_base64 = None
-              try:
-                  photo_bytes = await client.download_profile_photo(me, file=bytes)
-                  if photo_bytes:
-                      photo_base64 = base64.b64encode(photo_bytes).decode("utf-8")
-              except Exception:
-                  pass
-
-              return {
-                  "success": True,
-                  "user": {
-                      "id": me.id,
-                      "name": f"{me.first_name or ''} {me.last_name or ''}".strip(),
-                      "first_name": me.first_name or "",
-                      "last_name": me.last_name or "",
-                      "username": me.username,
-                      "photo_base64": photo_base64,
-                  }
-              }
-
-          except HTTPException:
-              raise
-          except Exception as e:
-              raise HTTPException(status_code=500, detail=str(e))
-          finally:
-              if client:
-                  await client.disconnect()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if client:
+            await client.disconnect()
