@@ -4,8 +4,12 @@ Finance App Backend
 и отдаёт транзакции Flutter приложению через REST API
 """
 
+# ============================================================
+# БЛОК 1: IMPORTS
+# ============================================================
+
 from telethon.errors import SessionPasswordNeededError
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from telethon import TelegramClient
@@ -14,8 +18,9 @@ import re
 import os
 import base64
 import hashlib
-from datetime import datetime
-from typing import Optional
+from datetime import datetime, date, timedelta
+from typing import Optional, List
+from calendar import monthrange
 
 app = FastAPI(title="Finance App API")
 
@@ -31,6 +36,41 @@ API_HASH = os.getenv("TELEGRAM_API_HASH", "")
 
 user_sessions: dict[str, str] = {}
 pending_logins: dict[str, dict] = {}
+
+# ============================================================
+# БЛОК 2: КОНСТАНТЫ
+# ============================================================
+
+RU_MONTHS = {
+    1: "Январь", 2: "Февраль", 3: "Март", 4: "Апрель",
+    5: "Май", 6: "Июнь", 7: "Июль", 8: "Август",
+    9: "Сентябрь", 10: "Октябрь", 11: "Ноябрь", 12: "Декабрь"
+}
+
+RU_MONTHS_GENITIVE = {
+    1: "января", 2: "февраля", 3: "марта", 4: "апреля",
+    5: "мая", 6: "июня", 7: "июля", 8: "августа",
+    9: "сентября", 10: "октября", 11: "ноября", 12: "декабря"
+}
+
+RU_WEEKDAYS = {
+    0: "Понедельник", 1: "Вторник", 2: "Среда",
+    3: "Четверг", 4: "Пятница", 5: "Суббота", 6: "Воскресенье"
+}
+
+RU_WEEKDAYS_SHORT = {
+    0: "Пн", 1: "Вт", 2: "Ср", 3: "Чт", 4: "Пт", 5: "Сб", 6: "Вс"
+}
+
+CATEGORY_RULES = [
+    ("transfer",  "Переводы",  ["p2p", "hu2hu", "card2card", "перевод", "зачисление перевода", "payme", "click"]),
+    ("food",      "Еда",       ["evos", "kfc", "oqtepa", "lavash", "cafe", "restaurant", "ресторан", "кафе", "burger", "pizza", "пицца"]),
+    ("market",    "Магазины",  ["korzinka", "makro", "havas", "market", "supermarket", "магазин", "супермаркет", "store"]),
+    ("taxi",      "Такси",     ["yandex", "taxi", "mytaxi", "такси", "yandexgo", "uber"]),
+    ("mobile",    "Связь",     ["beeline", "uzmobile", "ucell", "mobiuz", "paynet", "телефон"]),
+    ("cash",      "Наличные",  ["atm", "банкомат", "снятие", "cash"]),
+    ("shopping",  "Покупки",   ["uzum", "olx", "wildberries", "aliexpress", "shop"]),
+]
 
 # ============================================================
 # МОДЕЛИ
@@ -62,6 +102,8 @@ class Transaction(BaseModel):
     balance: Optional[float] = None
     balance_currency: Optional[str] = None
     icon: Optional[str] = None
+    category: Optional[str] = None
+    category_title: Optional[str] = None
     raw_text: str
 
 # ============================================================
@@ -71,7 +113,7 @@ class Transaction(BaseModel):
 def parse_uzs_amount(value: str) -> Optional[float]:
     if not value:
         return None
-    cleaned = value.replace(" ", "").replace("\xa0", "")
+    cleaned = value.replace(" ", "").replace("\xa0", "").replace("'", "")
     if "." in cleaned and "," in cleaned:
         cleaned = cleaned.replace(".", "").replace(",", ".")
     elif "," in cleaned and "." in cleaned:
@@ -135,7 +177,7 @@ def parse_humo_message(text: str, message_id: Optional[int] = None) -> Optional[
         amount_line = text
 
     amount_match = re.search(
-        r"([+-]?\d[\d\s.,]*)\s*(UZS|uzs|сум|sum)",
+        r"([+-]?\d[\d\s'.,]*)\s*(UZS|uzs|сум|sum)",
         amount_line,
         re.IGNORECASE
     )
@@ -194,7 +236,7 @@ def parse_humo_message(text: str, message_id: Optional[int] = None) -> Optional[
     for line in lines:
         if "💰" in line:
             balance_match = re.search(
-                r"([+-]?\d[\d\s.,]*)\s*(UZS|uzs|сум|sum)",
+                r"([+-]?\d[\d\s'.,]*)\s*(UZS|uzs|сум|sum)",
                 line,
                 re.IGNORECASE
             )
@@ -229,7 +271,6 @@ def parse_humo_message(text: str, message_id: Optional[int] = None) -> Optional[
         raw_text=text[:500]
     )
 
-
 # ============================================================
 # АНАЛИЗ СОСТОЯНИЯ HUMO БОТА
 # ============================================================
@@ -244,7 +285,6 @@ def analyze_humo_connection_state(messages) -> dict:
     sms_code_invalid = False
     phone_requested = False
     congratulations_found = False
-
     matched_signals = []
 
     for msg in ordered_messages:
@@ -261,11 +301,7 @@ def analyze_humo_connection_state(messages) -> dict:
             has_bot_started = True
             matched_signals.append("bot_started")
 
-        if (
-            "поздравляем" in text_lower
-            and "подключились" in text_lower
-            and not msg.out
-        ):
+        if "поздравляем" in text_lower and "подключились" in text_lower and not msg.out:
             congratulations_found = True
             card_connected = True
             matched_signals.append("congratulations_detected")
@@ -318,69 +354,350 @@ def analyze_humo_connection_state(messages) -> dict:
     unique_signals = list(set(matched_signals))
 
     if no_card_or_account and not card_connected:
-        return {
-            "has_bot_started": has_bot_started,
-            "is_registered": False,
-            "is_card_connected": False,
-            "can_read_transactions": False,
-            "status": "no_card_or_account_for_phone",
-            "reason": "HUMO bot сообщил что карта не найдена для этого номера",
-            "matched_signals": unique_signals,
-        }
-
+        return {"has_bot_started": has_bot_started, "is_registered": False, "is_card_connected": False, "can_read_transactions": False, "status": "no_card_or_account_for_phone", "reason": "HUMO bot сообщил что карта не найдена для этого номера", "matched_signals": unique_signals}
     if card_connected:
-        return {
-            "has_bot_started": True,
-            "is_registered": True,
-            "is_card_connected": True,
-            "can_read_transactions": True,
-            "status": "card_connected",
-            "reason": "Поздравление от HUMO bot получено — карта подключена" if congratulations_found else "Карта HUMO найдена в сообщениях",
-            "matched_signals": unique_signals,
-        }
-
+        return {"has_bot_started": True, "is_registered": True, "is_card_connected": True, "can_read_transactions": True, "status": "card_connected", "reason": "Поздравление от HUMO bot получено — карта подключена" if congratulations_found else "Карта HUMO найдена в сообщениях", "matched_signals": unique_signals}
     if sms_code_invalid:
-        return {
-            "has_bot_started": has_bot_started,
-            "is_registered": False,
-            "is_card_connected": False,
-            "can_read_transactions": False,
-            "status": "sms_code_invalid",
-            "reason": "Неверный SMS-код",
-            "matched_signals": unique_signals,
-        }
-
+        return {"has_bot_started": has_bot_started, "is_registered": False, "is_card_connected": False, "can_read_transactions": False, "status": "sms_code_invalid", "reason": "Неверный SMS-код", "matched_signals": unique_signals}
     if sms_code_waiting:
-        return {
-            "has_bot_started": has_bot_started,
-            "is_registered": False,
-            "is_card_connected": False,
-            "can_read_transactions": False,
-            "status": "sms_code_waiting",
-            "reason": "HUMO bot ждёт SMS-код",
-            "matched_signals": unique_signals,
-        }
-
+        return {"has_bot_started": has_bot_started, "is_registered": False, "is_card_connected": False, "can_read_transactions": False, "status": "sms_code_waiting", "reason": "HUMO bot ждёт SMS-код", "matched_signals": unique_signals}
     if phone_requested:
+        return {"has_bot_started": has_bot_started, "is_registered": False, "is_card_connected": False, "can_read_transactions": False, "status": "phone_required", "reason": "HUMO bot просит номер телефона", "matched_signals": unique_signals}
+
+    return {"has_bot_started": has_bot_started, "is_registered": False, "is_card_connected": False, "can_read_transactions": False, "status": "started_not_registered" if has_bot_started else "not_started", "reason": "Бот запущен но карта не подключена" if has_bot_started else "Бот не запускался", "matched_signals": unique_signals}
+
+# ============================================================
+# БЛОК 3: HELPER FUNCTIONS
+# ============================================================
+
+def detect_category(tx: dict) -> tuple:
+    search_text = " ".join(filter(None, [
+        tx.get("merchant", ""),
+        tx.get("title", ""),
+        tx.get("description", ""),
+        tx.get("raw_text", ""),
+    ])).lower()
+
+    for cat_id, cat_title, keywords in CATEGORY_RULES:
+        if any(kw in search_text for kw in keywords):
+            return cat_id, cat_title
+    return "other", "Другое"
+
+
+def parse_transaction_datetime(tx: dict) -> Optional[datetime]:
+    if tx.get("datetime"):
+        try:
+            return datetime.fromisoformat(tx["datetime"])
+        except Exception:
+            pass
+    if tx.get("date"):
+        try:
+            return datetime.strptime(tx["date"], "%d.%m.%Y")
+        except Exception:
+            pass
+    return None
+
+
+def normalize_transaction(tx: dict) -> dict:
+    cat_id, cat_title = detect_category(tx)
+    tx["category"] = cat_id
+    tx["category_title"] = cat_title
+    return tx
+
+
+def get_month_range(month: str) -> tuple:
+    year, mon = int(month[:4]), int(month[5:7])
+    start = date(year, mon, 1)
+    last_day = monthrange(year, mon)[1]
+    end = date(year, mon, last_day)
+    return start, end
+
+
+def get_period_range(period: str) -> tuple:
+    today = date.today()
+    if period == "day":
+        return today, today
+    elif period == "week":
+        start = today - timedelta(days=today.weekday())
+        return start, today
+    elif period == "month":
+        start = date(today.year, today.month, 1)
+        return start, today
+    elif period == "3months":
+        start = today - timedelta(days=90)
+        return start, today
+    elif period == "year":
+        start = date(today.year, 1, 1)
+        return start, today
+    else:
+        return today - timedelta(days=7), today
+
+
+def filter_transactions_by_date_range(transactions: list, start: date, end: date) -> list:
+    result = []
+    for tx in transactions:
+        dt = parse_transaction_datetime(tx)
+        if dt is None:
+            continue
+        if start <= dt.date() <= end:
+            result.append(tx)
+    return result
+
+
+def calculate_summary(transactions: list) -> dict:
+    incomes = [t for t in transactions if t["type"] == "income"]
+    expenses = [t for t in transactions if t["type"] == "expense"]
+    income_total = sum(t["amount"] for t in incomes)
+    expense_total = sum(t["amount"] for t in expenses)
+    return {
+        "income_total": round(income_total, 2),
+        "expense_total": round(expense_total, 2),
+        "net_total": round(income_total - expense_total, 2),
+        "transactions_count": len(transactions),
+        "income_count": len(incomes),
+        "expense_count": len(expenses),
+        "average_expense": round(expense_total / len(expenses), 2) if expenses else 0,
+        "average_income": round(income_total / len(incomes), 2) if incomes else 0,
+    }
+
+
+def build_day_label(tx_date: date, selected_month: str) -> str:
+    today = date.today()
+    yesterday = today - timedelta(days=1)
+    current_month = today.strftime("%Y-%m")
+    if selected_month == current_month:
+        if tx_date == today:
+            return "Сегодня"
+        if tx_date == yesterday:
+            return "Вчера"
+    weekday = RU_WEEKDAYS[tx_date.weekday()]
+    day = tx_date.day
+    month = RU_MONTHS_GENITIVE[tx_date.month]
+    return f"{weekday}, {day} {month}"
+
+
+def group_transactions_by_day(transactions: list, selected_month: str) -> list:
+    groups: dict = {}
+    for tx in transactions:
+        dt = parse_transaction_datetime(tx)
+        if dt is None:
+            continue
+        tx_date = dt.date()
+        date_key = tx_date.isoformat()
+        if date_key not in groups:
+            groups[date_key] = {
+                "label": build_day_label(tx_date, selected_month),
+                "date": date_key,
+                "weekday": RU_WEEKDAYS[tx_date.weekday()],
+                "income_total": 0.0,
+                "expense_total": 0.0,
+                "transactions_count": 0,
+                "transactions": [],
+            }
+        groups[date_key]["transactions"].append(tx)
+        groups[date_key]["transactions_count"] += 1
+        if tx["type"] == "income":
+            groups[date_key]["income_total"] += tx["amount"]
+        else:
+            groups[date_key]["expense_total"] += tx["amount"]
+
+    sorted_groups = sorted(groups.values(), key=lambda g: g["date"], reverse=True)
+    for g in sorted_groups:
+        g["income_total"] = round(g["income_total"], 2)
+        g["expense_total"] = round(g["expense_total"], 2)
+    return sorted_groups
+
+
+def build_top_categories(transactions: list) -> list:
+    cat_totals: dict = {}
+    for tx in transactions:
+        if tx["type"] != "expense":
+            continue
+        cat_id = tx.get("category", "other")
+        cat_title = tx.get("category_title", "Другое")
+        if cat_id not in cat_totals:
+            cat_totals[cat_id] = {"category": cat_id, "category_title": cat_title, "total": 0.0, "count": 0}
+        cat_totals[cat_id]["total"] += tx["amount"]
+        cat_totals[cat_id]["count"] += 1
+
+    total_expense = sum(c["total"] for c in cat_totals.values())
+    result = []
+    for cat in sorted(cat_totals.values(), key=lambda c: c["total"], reverse=True):
+        cat["total"] = round(cat["total"], 2)
+        cat["percent"] = round(cat["total"] / total_expense * 100, 1) if total_expense > 0 else 0
+        result.append(cat)
+    return result[:6]
+
+
+def get_top_expense(transactions: list) -> Optional[dict]:
+    expenses = [t for t in transactions if t["type"] == "expense"]
+    if not expenses:
+        return None
+    return max(expenses, key=lambda t: t["amount"])
+
+
+def get_last_balance(transactions: list) -> Optional[dict]:
+    for tx in transactions:
+        if tx.get("balance") is not None:
+            return {
+                "balance": tx["balance"],
+                "balance_currency": tx.get("balance_currency", "UZS"),
+                "card_last4": tx.get("card_last4"),
+                "date": tx.get("date"),
+            }
+    return None
+
+
+def get_previous_month(month: str) -> str:
+    year, mon = int(month[:4]), int(month[5:7])
+    if mon == 1:
+        return f"{year - 1}-12"
+    return f"{year}-{mon - 1:02d}"
+
+
+def build_month_insight(current: dict, previous: Optional[dict]) -> dict:
+    if previous is None or previous["expense_total"] == 0:
+        return {"type": "info", "text": "Первый месяц с данными — сравнение недоступно", "percent": 0, "direction": "new"}
+
+    curr_exp = current["expense_total"]
+    prev_exp = previous["expense_total"]
+
+    if prev_exp == 0:
+        return {"type": "info", "text": "В прошлом месяце не было расходов", "percent": 0, "direction": "none"}
+
+    diff_percent = round((curr_exp - prev_exp) / prev_exp * 100, 1)
+
+    if diff_percent > 20:
+        return {"type": "warning", "text": f"Расходы выросли на {abs(diff_percent)}% по сравнению с прошлым месяцем", "percent": abs(diff_percent), "direction": "up"}
+    elif diff_percent < -10:
+        return {"type": "success", "text": f"Расходы снизились на {abs(diff_percent)}% — отличный результат!", "percent": abs(diff_percent), "direction": "down"}
+    else:
+        return {"type": "neutral", "text": "Расходы примерно на том же уровне, что и в прошлом месяце", "percent": abs(diff_percent), "direction": "same"}
+
+
+def build_chart(transactions: list, period: str, start: date, end: date) -> list:
+    if period == "day":
+        chart = {h: {"label": f"{h:02d}:00", "date": start.isoformat(), "income": 0.0, "expense": 0.0} for h in range(24)}
+        for tx in transactions:
+            dt = parse_transaction_datetime(tx)
+            if dt:
+                h = dt.hour
+                if tx["type"] == "income":
+                    chart[h]["income"] += tx["amount"]
+                else:
+                    chart[h]["expense"] += tx["amount"]
+        return [{"label": v["label"], "date": v["date"], "income": round(v["income"], 2), "expense": round(v["expense"], 2)} for v in chart.values()]
+
+    elif period in ("week", "month"):
+        chart = {}
+        current = start
+        while current <= end:
+            key = current.isoformat()
+            label = RU_WEEKDAYS_SHORT[current.weekday()] if period == "week" else str(current.day)
+            chart[key] = {"label": label, "date": key, "income": 0.0, "expense": 0.0}
+            current += timedelta(days=1)
+        for tx in transactions:
+            dt = parse_transaction_datetime(tx)
+            if dt:
+                key = dt.date().isoformat()
+                if key in chart:
+                    if tx["type"] == "income":
+                        chart[key]["income"] += tx["amount"]
+                    else:
+                        chart[key]["expense"] += tx["amount"]
+        return [{"label": v["label"], "date": v["date"], "income": round(v["income"], 2), "expense": round(v["expense"], 2)} for v in chart.values()]
+
+    else:
+        chart = {}
+        current = date(start.year, start.month, 1)
+        while current <= end:
+            key = current.strftime("%Y-%m")
+            chart[key] = {"label": RU_MONTHS[current.month], "date": key, "income": 0.0, "expense": 0.0}
+            if current.month == 12:
+                current = date(current.year + 1, 1, 1)
+            else:
+                current = date(current.year, current.month + 1, 1)
+        for tx in transactions:
+            dt = parse_transaction_datetime(tx)
+            if dt:
+                key = dt.strftime("%Y-%m")
+                if key in chart:
+                    if tx["type"] == "income":
+                        chart[key]["income"] += tx["amount"]
+                    else:
+                        chart[key]["expense"] += tx["amount"]
+        return [{"label": v["label"], "date": v["date"], "income": round(v["income"], 2), "expense": round(v["expense"], 2)} for v in chart.values()]
+
+
+# ============================================================
+# БЛОК 4: LOAD TRANSACTIONS FROM HUMO
+# ============================================================
+
+async def load_transactions_from_humo(
+    x_session_token: str,
+    limit: int = 500,
+    offset_id: int = 0
+) -> dict:
+    client = None
+    try:
+        client = TelegramClient(StringSession(x_session_token), API_ID, API_HASH)
+        await client.connect()
+
+        if not await client.is_user_authorized():
+            raise HTTPException(status_code=401, detail="SESSION_EXPIRED")
+
+        entity = await client.get_entity("@HUMOcardbot")
+        messages = await client.get_messages(
+            entity,
+            limit=limit,
+            offset_id=offset_id if offset_id > 0 else 0
+        )
+
+        transactions = []
+        last_message_id = None
+
+        for msg in messages:
+            if msg.out:
+                continue
+            if msg.sender_id and msg.sender_id != entity.id:
+                continue
+            if not msg.text:
+                continue
+
+            text = msg.text
+
+            if "история платежей" in text.lower():
+                continue
+
+            if text.count("➖") + text.count("➕") > 1:
+                continue
+
+            has_amount = "➕" in text or "➖" in text
+            has_card = "💳" in text
+            has_time = bool(re.search(r"\d{2}:\d{2}", text))
+
+            if not (has_amount and has_card and has_time):
+                continue
+
+            tx = parse_humo_message(text, msg.id)
+            if tx:
+                tx_dict = tx.dict()
+                tx_dict = normalize_transaction(tx_dict)
+                transactions.append(tx_dict)
+                last_message_id = msg.id
+
         return {
-            "has_bot_started": has_bot_started,
-            "is_registered": False,
-            "is_card_connected": False,
-            "can_read_transactions": False,
-            "status": "phone_required",
-            "reason": "HUMO bot просит номер телефона",
-            "matched_signals": unique_signals,
+            "transactions": transactions,
+            "has_more": len(messages) == limit,
+            "next_offset_id": last_message_id,
         }
 
-    return {
-        "has_bot_started": has_bot_started,
-        "is_registered": False,
-        "is_card_connected": False,
-        "can_read_transactions": False,
-        "status": "started_not_registered" if has_bot_started else "not_started",
-        "reason": "Бот запущен но карта не подключена" if has_bot_started else "Бот не запускался",
-        "matched_signals": unique_signals,
-    }
+    finally:
+        if client:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
 
 
 # ============================================================
@@ -406,7 +723,6 @@ async def debug_env():
 
 @app.post("/auth/send-code")
 async def send_code(req: PhoneRequest):
-    """Шаг 1: Отправляем код на номер телефона"""
     try:
         client = TelegramClient(StringSession(), API_ID, API_HASH)
         await client.connect()
@@ -417,36 +733,21 @@ async def send_code(req: PhoneRequest):
             "phone_code_hash": result.phone_code_hash
         }
         await client.disconnect()
-        return {
-            "success": True,
-            "phone_code_hash": result.phone_code_hash,
-            "message": "Код отправлен в Telegram"
-        }
+        return {"success": True, "phone_code_hash": result.phone_code_hash, "message": "Код отправлен в Telegram"}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.post("/auth/verify-code")
 async def verify_code(req: CodeRequest):
-    """Шаг 2: Подтверждаем код и получаем сессию"""
     pending = pending_logins.get(req.phone)
     if not pending:
         raise HTTPException(status_code=400, detail="Сначала запросите код")
-
     try:
-        client = TelegramClient(
-            StringSession(pending["session"]),
-            API_ID,
-            API_HASH
-        )
+        client = TelegramClient(StringSession(pending["session"]), API_ID, API_HASH)
         await client.connect()
-
         try:
-            await client.sign_in(
-                phone=req.phone,
-                code=req.code,
-                phone_code_hash=req.phone_code_hash
-            )
+            await client.sign_in(phone=req.phone, code=req.code, phone_code_hash=req.phone_code_hash)
         except SessionPasswordNeededError:
             if not req.password:
                 await client.disconnect()
@@ -481,7 +782,6 @@ async def verify_code(req: CodeRequest):
                 "photo_base64": photo_base64,
             }
         }
-
     except HTTPException:
         raise
     except Exception as e:
@@ -490,17 +790,13 @@ async def verify_code(req: CodeRequest):
 
 @app.get("/auth/me")
 async def get_me(x_session_token: str = Header(...)):
-    """При старте приложения — проверяем токен и отдаём данные юзера"""
     client = None
     try:
         client = TelegramClient(StringSession(x_session_token), API_ID, API_HASH)
         await client.connect()
-
         if not await client.is_user_authorized():
             raise HTTPException(status_code=401, detail="SESSION_EXPIRED")
-
         me = await client.get_me()
-
         photo_base64 = None
         try:
             photo_bytes = await client.download_profile_photo(me, file=bytes)
@@ -508,7 +804,6 @@ async def get_me(x_session_token: str = Header(...)):
                 photo_base64 = base64.b64encode(photo_bytes).decode("utf-8")
         except Exception:
             pass
-
         return {
             "success": True,
             "user": {
@@ -520,7 +815,6 @@ async def get_me(x_session_token: str = Header(...)):
                 "photo_base64": photo_base64,
             }
         }
-
     except HTTPException:
         raise
     except Exception as e:
@@ -532,7 +826,6 @@ async def get_me(x_session_token: str = Header(...)):
 
 @app.post("/auth/logout")
 async def logout(x_session_token: str = Header(...)):
-    """Выход из аккаунта"""
     client = None
     try:
         client = TelegramClient(StringSession(x_session_token), API_ID, API_HASH)
@@ -552,52 +845,27 @@ async def logout(x_session_token: str = Header(...)):
 
 @app.get("/check-bot")
 async def check_bot(x_session_token: str = Header(...)):
-    """Проверяем Telegram-сессию, наличие HUMO bot и подключена ли карта"""
     client = None
     try:
         client = TelegramClient(StringSession(x_session_token), API_ID, API_HASH)
         await client.connect()
-
         if not await client.is_user_authorized():
             raise HTTPException(status_code=401, detail="SESSION_EXPIRED")
-
         try:
             entity = await client.get_entity("@HUMOcardbot")
         except Exception as e:
             return {
-                "success": True,
-                "authorized": True,
-                "has_bot": False,
-                "has_messages": False,
-                "humo": {
-                    "has_bot_started": False,
-                    "is_registered": False,
-                    "is_card_connected": False,
-                    "can_read_transactions": False,
-                    "status": "bot_not_found",
-                    "reason": str(e),
-                    "matched_signals": []
-                },
+                "success": True, "authorized": True, "has_bot": False, "has_messages": False,
+                "humo": {"has_bot_started": False, "is_registered": False, "is_card_connected": False, "can_read_transactions": False, "status": "bot_not_found", "reason": str(e), "matched_signals": []},
                 "message": "HUMO bot не найден в чатах пользователя"
             }
-
         messages = await client.get_messages(entity, limit=100)
-        has_messages = len(messages) > 0
         humo = analyze_humo_connection_state(messages)
-
         return {
-            "success": True,
-            "authorized": True,
-            "has_bot": True,
-            "has_messages": has_messages,
-            "bot": {
-                "id": entity.id,
-                "username": getattr(entity, "username", None),
-                "title": getattr(entity, "first_name", None)
-            },
+            "success": True, "authorized": True, "has_bot": True, "has_messages": len(messages) > 0,
+            "bot": {"id": entity.id, "username": getattr(entity, "username", None), "title": getattr(entity, "first_name", None)},
             "humo": humo
         }
-
     except HTTPException:
         raise
     except Exception as e:
@@ -606,6 +874,10 @@ async def check_bot(x_session_token: str = Header(...)):
         if client:
             await client.disconnect()
 
+
+# ============================================================
+# БЛОК 5: ОБНОВЛЁННЫЙ /transactions
+# ============================================================
 
 @app.get("/transactions")
 async def get_transactions(
@@ -613,74 +885,146 @@ async def get_transactions(
     limit: int = 50,
     offset_id: int = 0
 ):
-    """Получаем транзакции из @HUMOcardbot с пагинацией"""
-    client = None
     try:
-        client = TelegramClient(StringSession(x_session_token), API_ID, API_HASH)
-        await client.connect()
-
-        if not await client.is_user_authorized():
-            raise HTTPException(status_code=401, detail="Сессия истекла")
-
-        entity = await client.get_entity("@HUMOcardbot")
-        messages = await client.get_messages(
-            entity,
-            limit=limit,
-            offset_id=offset_id
-        )
-
-        transactions = []
-        last_message_id = None
-
-        for msg in messages:
-            if msg.out:
-                continue
-            if msg.sender_id and msg.sender_id != entity.id:
-                continue
-            if not msg.text:
-                continue
-
-            text = msg.text
-
-            # Пропускаем сводные сообщения "История платежей"
-            if "история платежей" in text.lower():
-                continue
-
-            # Пропускаем если содержит несколько транзакций (много ➖/➕)
-            if text.count("➖") + text.count("➕") > 1:
-                continue
-
-            # Одиночная транзакция должна содержать ➕/➖, 💳, и время ЧЧ:ММ
-            has_amount = "➕" in text or "➖" in text
-            has_card = "💳" in text
-            has_time = bool(re.search(r"\d{2}:\d{2}", text))
-
-            if not (has_amount and has_card and has_time):
-                continue
-
-            tx = parse_humo_message(text, msg.id)
-            if tx:
-                transactions.append(tx.dict())
-                last_message_id = msg.id
-
+        result = await load_transactions_from_humo(x_session_token, limit=limit, offset_id=offset_id)
+        transactions = result["transactions"]
         income_total = sum(t["amount"] for t in transactions if t["type"] == "income")
         expense_total = sum(t["amount"] for t in transactions if t["type"] == "expense")
-
         return {
             "success": True,
             "count": len(transactions),
-            "income_total": income_total,
-            "expense_total": expense_total,
+            "income_total": round(income_total, 2),
+            "expense_total": round(expense_total, 2),
             "currency": "UZS",
-            "has_more": len(messages) == limit,
-            "next_offset_id": last_message_id,
-            "transactions": transactions
+            "has_more": result["has_more"],
+            "next_offset_id": result["next_offset_id"],
+            "transactions": transactions,
         }
-
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        if client:
-            await client.disconnect()
+
+
+# ============================================================
+# БЛОК 6: GET /dashboard
+# ============================================================
+
+@app.get("/dashboard")
+async def get_dashboard(
+    x_session_token: str = Header(...),
+    month: Optional[str] = Query(None, description="Формат YYYY-MM, например 2026-05")
+):
+    try:
+        today = date.today()
+        current_month = today.strftime("%Y-%m")
+
+        if month is None:
+            month = current_month
+
+        try:
+            year, mon = int(month[:4]), int(month[5:7])
+            date(year, mon, 1)  # валидация
+        except Exception:
+            raise HTTPException(status_code=400, detail="Неверный формат month. Используйте YYYY-MM")
+
+        if month > current_month:
+            raise HTTPException(status_code=400, detail="Нельзя запрашивать будущий месяц")
+
+        month_title = f"{RU_MONTHS[mon]} {year}"
+        start_date, end_date = get_month_range(month)
+
+        result = await load_transactions_from_humo(x_session_token, limit=500)
+        all_transactions = result["transactions"]
+
+        month_transactions = filter_transactions_by_date_range(all_transactions, start_date, end_date)
+        month_transactions.sort(key=lambda t: parse_transaction_datetime(t) or datetime.min, reverse=True)
+
+        current_summary = calculate_summary(month_transactions)
+
+        previous_month = get_previous_month(month)
+        prev_start, prev_end = get_month_range(previous_month)
+        prev_transactions = filter_transactions_by_date_range(all_transactions, prev_start, prev_end)
+        previous_summary = calculate_summary(prev_transactions) if prev_transactions else None
+
+        insight = build_month_insight(current_summary, previous_summary)
+        transaction_groups = group_transactions_by_day(month_transactions, month)
+        top_categories = build_top_categories(month_transactions)
+        top_expense = get_top_expense(month_transactions)
+        last_balance = get_last_balance(month_transactions)
+
+        return {
+            "success": True,
+            "screen": "dashboard",
+            "month": month,
+            "month_title": month_title,
+            "can_go_next_month": month < current_month,
+            "can_go_previous_month": True,
+            "currency": "UZS",
+            "summary": current_summary,
+            "top_categories": top_categories,
+            "top_expense": top_expense,
+            "last_balance": last_balance,
+            "insight": insight,
+            "transaction_groups": transaction_groups,
+            "has_more": result["has_more"],
+            "next_offset_id": result["next_offset_id"],
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================
+# БЛОК 7: GET /analytics
+# ============================================================
+
+@app.get("/analytics")
+async def get_analytics(
+    x_session_token: str = Header(...),
+    period: str = Query("week", description="day | week | month | 3months | year")
+):
+    try:
+        valid_periods = ["day", "week", "month", "3months", "year"]
+        if period not in valid_periods:
+            raise HTTPException(status_code=400, detail=f"Неверный period. Допустимые: {', '.join(valid_periods)}")
+
+        start_date, end_date = get_period_range(period)
+
+        limit_map = {"day": 100, "week": 200, "month": 300, "3months": 500, "year": 500}
+        load_limit = limit_map.get(period, 300)
+
+        result = await load_transactions_from_humo(x_session_token, limit=load_limit)
+        all_transactions = result["transactions"]
+
+        period_transactions = filter_transactions_by_date_range(all_transactions, start_date, end_date)
+        period_transactions.sort(key=lambda t: parse_transaction_datetime(t) or datetime.min, reverse=True)
+
+        summary = calculate_summary(period_transactions)
+        chart = build_chart(period_transactions, period, start_date, end_date)
+        categories = build_top_categories(period_transactions)
+        top_expense = get_top_expense(period_transactions)
+        last_balance = get_last_balance(period_transactions)
+
+        current_month = date.today().strftime("%Y-%m")
+        transaction_groups = group_transactions_by_day(period_transactions, current_month)
+
+        return {
+            "success": True,
+            "screen": "analytics",
+            "period": period,
+            "from": start_date.isoformat(),
+            "to": end_date.isoformat(),
+            "currency": "UZS",
+            "summary": summary,
+            "chart": chart,
+            "categories": categories,
+            "top_expense": top_expense,
+            "last_balance": last_balance,
+            "transaction_groups": transaction_groups,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
