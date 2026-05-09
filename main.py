@@ -641,6 +641,16 @@ async def get_transactions(
                 continue
 
             text = msg.text
+
+            # Пропускаем сводные сообщения "История платежей"
+            if "история платежей" in text.lower():
+                continue
+
+            # Пропускаем если содержит несколько транзакций (много ➖/➕)
+            if text.count("➖") + text.count("➕") > 1:
+                continue
+
+            # Одиночная транзакция должна содержать ➕/➖, 💳, и время ЧЧ:ММ
             has_amount = "➕" in text or "➖" in text
             has_card = "💳" in text
             has_time = bool(re.search(r"\d{2}:\d{2}", text))
