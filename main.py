@@ -71,7 +71,19 @@ CATEGORY_RULES = [
     ("cash",      "Наличные",  ["atm", "банкомат", "снятие", "cash"]),
     ("shopping",  "Покупки",   ["uzum", "olx", "wildberries", "aliexpress", "shop"]),
 ]
-
+KANBAN_CATEGORIES = [
+    {"id": "uncategorized", "title": "Неразобранные"},
+    {"id": "food", "title": "Еда"},
+    {"id": "transport", "title": "Транспорт"},
+    {"id": "market", "title": "Магазины"},
+    {"id": "transfer", "title": "Переводы"},
+    {"id": "subscription", "title": "Подписки"},
+    {"id": "cash", "title": "Наличные"},
+    {"id": "shopping", "title": "Покупки"},
+    {"id": "mobile", "title": "Связь"},
+    {"id": "other", "title": "Другое"},
+    {"id": "ignored", "title": "Игнорировать"},
+]
 # ============================================================
 # МОДЕЛИ
 # ============================================================
@@ -385,18 +397,55 @@ def detect_category(tx: dict) -> tuple:
 
 
 def parse_transaction_datetime(tx: dict) -> Optional[datetime]:
-    if tx.get("datetime"):
-        try:
-            return datetime.fromisoformat(tx["datetime"])
-        except Exception:
-            pass
-    if tx.get("date"):
-        try:
-            return datetime.strptime(tx["date"], "%d.%m.%Y")
-        except Exception:
-            pass
-    return None
+    """
+    Надёжно превращает transaction date/time в datetime.
 
+    Поддерживает:
+    - tx["datetime"] = "2026-05-01T11:01:00"
+    - tx["date"] = "01.05.2026" + tx["time"] = "11:01"
+    - tx["date"] = "01-05-2026"
+    - tx["date"] = "01/05/2026"
+
+    Если time нет, используется 00:00.
+    """
+    if not tx:
+        return None
+
+    dt_value = tx.get("datetime")
+    if dt_value:
+        try:
+            return datetime.fromisoformat(str(dt_value))
+        except Exception:
+            pass
+
+    date_value = tx.get("date")
+    if not date_value:
+        return None
+
+    time_value = tx.get("time") or "00:00"
+
+    date_formats = [
+        "%d.%m.%Y",
+        "%d-%m-%Y",
+        "%d/%m/%Y",
+    ]
+
+    for date_format in date_formats:
+        try:
+            return datetime.strptime(
+                f"{date_value} {time_value}",
+                f"{date_format} %H:%M"
+            )
+        except Exception:
+            continue
+
+    for date_format in date_formats:
+        try:
+            return datetime.strptime(str(date_value), date_format)
+        except Exception:
+            continue
+
+    return None
 
 def normalize_transaction(tx: dict) -> dict:
     cat_id, cat_title = detect_category(tx)
@@ -414,23 +463,47 @@ def get_month_range(month: str) -> tuple:
 
 
 def get_period_range(period: str) -> tuple:
+    """
+    Возвращает date range для analytics.
+
+    day      -> сегодня
+    week     -> текущая неделя с понедельника до сегодня
+    month    -> текущий месяц с 1 числа до сегодня
+    3months  -> последние 3 календарных месяца, включая текущий
+    year     -> текущий год с 1 января до сегодня
+    """
     today = date.today()
+
     if period == "day":
         return today, today
-    elif period == "week":
+
+    if period == "week":
         start = today - timedelta(days=today.weekday())
         return start, today
-    elif period == "month":
+
+    if period == "month":
         start = date(today.year, today.month, 1)
         return start, today
-    elif period == "3months":
-        start = today - timedelta(days=90)
+
+    if period == "3months":
+        start_month = today.month - 2
+        start_year = today.year
+
+        while start_month <= 0:
+            start_month += 12
+            start_year -= 1
+
+        start = date(start_year, start_month, 1)
         return start, today
-    elif period == "year":
+
+    if period == "year":
         start = date(today.year, 1, 1)
         return start, today
-    else:
-        return today - timedelta(days=7), today
+
+    # fallback, если кто-то отправил мусор, хотя /analytics уже валидирует period
+    start = today - timedelta(days=7)
+    return start, today
+
 
 
 def filter_transactions_by_date_range(transactions: list, start: date, end: date) -> list:
@@ -537,14 +610,27 @@ def get_top_expense(transactions: list) -> Optional[dict]:
 
 
 def get_last_balance(transactions: list) -> Optional[dict]:
-    for tx in transactions:
+    """
+    Берёт баланс из самой новой транзакции, где balance != None.
+    Это баланс по последней операции, не гарантированно текущий банковский баланс.
+    """
+    sorted_transactions = sorted(
+        transactions,
+        key=lambda tx: parse_transaction_datetime(tx) or datetime.min,
+        reverse=True
+    )
+
+    for tx in sorted_transactions:
         if tx.get("balance") is not None:
             return {
-                "balance": tx["balance"],
-                "balance_currency": tx.get("balance_currency", "UZS"),
+                "balance": tx.get("balance"),
+                "balance_currency": tx.get("balance_currency") or tx.get("currency") or "UZS",
                 "card_last4": tx.get("card_last4"),
                 "date": tx.get("date"),
+                "time": tx.get("time"),
+                "datetime": tx.get("datetime"),
             }
+
     return None
 
 
@@ -576,62 +662,207 @@ def build_month_insight(current: dict, previous: Optional[dict]) -> dict:
 
 
 def build_chart(transactions: list, period: str, start: date, end: date) -> list:
+    """
+    Строит chart для analytics.
+
+    day:
+      24 точки по часам.
+
+    week:
+      7 дней текущей недели, даже если end=today.
+
+    month:
+      все дни от start до end.
+
+    3months:
+      по месяцам от start до end.
+
+    year:
+      все 12 месяцев текущего года.
+    """
+
+    def add_amount(point: dict, tx: dict) -> None:
+        amount = tx.get("amount", 0) or 0
+        if tx.get("type") == "income":
+            point["income"] += amount
+        elif tx.get("type") == "expense":
+            point["expense"] += amount
+
     if period == "day":
-        chart = {h: {"label": f"{h:02d}:00", "date": start.isoformat(), "income": 0.0, "expense": 0.0} for h in range(24)}
+        chart = {
+            h: {
+                "label": f"{h:02d}:00",
+                "date": start.isoformat(),
+                "income": 0.0,
+                "expense": 0.0,
+            }
+            for h in range(24)
+        }
+
         for tx in transactions:
             dt = parse_transaction_datetime(tx)
-            if dt:
-                h = dt.hour
-                if tx["type"] == "income":
-                    chart[h]["income"] += tx["amount"]
-                else:
-                    chart[h]["expense"] += tx["amount"]
-        return [{"label": v["label"], "date": v["date"], "income": round(v["income"], 2), "expense": round(v["expense"], 2)} for v in chart.values()]
+            if not dt:
+                continue
+            add_amount(chart[dt.hour], tx)
 
-    elif period in ("week", "month"):
+        return [
+            {
+                "label": item["label"],
+                "date": item["date"],
+                "income": round(item["income"], 2),
+                "expense": round(item["expense"], 2),
+            }
+            for item in chart.values()
+        ]
+
+    if period == "week":
+        week_start = start
+        week_end = start + timedelta(days=6)
+
+        chart = {}
+        current = week_start
+
+        while current <= week_end:
+            key = current.isoformat()
+            chart[key] = {
+                "label": RU_WEEKDAYS_SHORT[current.weekday()],
+                "date": key,
+                "income": 0.0,
+                "expense": 0.0,
+            }
+            current += timedelta(days=1)
+
+        for tx in transactions:
+            dt = parse_transaction_datetime(tx)
+            if not dt:
+                continue
+
+            key = dt.date().isoformat()
+            if key in chart:
+                add_amount(chart[key], tx)
+
+        return [
+            {
+                "label": item["label"],
+                "date": item["date"],
+                "income": round(item["income"], 2),
+                "expense": round(item["expense"], 2),
+            }
+            for item in chart.values()
+        ]
+
+    if period == "month":
         chart = {}
         current = start
+
         while current <= end:
             key = current.isoformat()
-            label = RU_WEEKDAYS_SHORT[current.weekday()] if period == "week" else str(current.day)
-            chart[key] = {"label": label, "date": key, "income": 0.0, "expense": 0.0}
+            chart[key] = {
+                "label": str(current.day),
+                "date": key,
+                "income": 0.0,
+                "expense": 0.0,
+            }
             current += timedelta(days=1)
+
         for tx in transactions:
             dt = parse_transaction_datetime(tx)
-            if dt:
-                key = dt.date().isoformat()
-                if key in chart:
-                    if tx["type"] == "income":
-                        chart[key]["income"] += tx["amount"]
-                    else:
-                        chart[key]["expense"] += tx["amount"]
-        return [{"label": v["label"], "date": v["date"], "income": round(v["income"], 2), "expense": round(v["expense"], 2)} for v in chart.values()]
+            if not dt:
+                continue
 
-    else:
+            key = dt.date().isoformat()
+            if key in chart:
+                add_amount(chart[key], tx)
+
+        return [
+            {
+                "label": item["label"],
+                "date": item["date"],
+                "income": round(item["income"], 2),
+                "expense": round(item["expense"], 2),
+            }
+            for item in chart.values()
+        ]
+
+    if period == "3months":
         chart = {}
         current = date(start.year, start.month, 1)
+
         while current <= end:
             key = current.strftime("%Y-%m")
-            chart[key] = {"label": RU_MONTHS[current.month], "date": key, "income": 0.0, "expense": 0.0}
+            chart[key] = {
+                "label": RU_MONTHS[current.month],
+                "date": key,
+                "income": 0.0,
+                "expense": 0.0,
+            }
+
             if current.month == 12:
                 current = date(current.year + 1, 1, 1)
             else:
                 current = date(current.year, current.month + 1, 1)
+
         for tx in transactions:
             dt = parse_transaction_datetime(tx)
-            if dt:
-                key = dt.strftime("%Y-%m")
-                if key in chart:
-                    if tx["type"] == "income":
-                        chart[key]["income"] += tx["amount"]
-                    else:
-                        chart[key]["expense"] += tx["amount"]
-        return [{"label": v["label"], "date": v["date"], "income": round(v["income"], 2), "expense": round(v["expense"], 2)} for v in chart.values()]
+            if not dt:
+                continue
 
+            key = dt.strftime("%Y-%m")
+            if key in chart:
+                add_amount(chart[key], tx)
+
+        return [
+            {
+                "label": item["label"],
+                "date": item["date"],
+                "income": round(item["income"], 2),
+                "expense": round(item["expense"], 2),
+            }
+            for item in chart.values()
+        ]
+
+    if period == "year":
+        chart = {}
+
+        for month_num in range(1, 13):
+            key = f"{start.year}-{month_num:02d}"
+            chart[key] = {
+                "label": RU_MONTHS[month_num],
+                "date": key,
+                "income": 0.0,
+                "expense": 0.0,
+            }
+
+        for tx in transactions:
+            dt = parse_transaction_datetime(tx)
+            if not dt:
+                continue
+
+            key = dt.strftime("%Y-%m")
+            if key in chart:
+                add_amount(chart[key], tx)
+
+        return [
+            {
+                "label": item["label"],
+                "date": item["date"],
+                "income": round(item["income"], 2),
+                "expense": round(item["expense"], 2),
+            }
+            for item in chart.values()
+        ]
+
+    return []
 
 # ============================================================
 # БЛОК 4: LOAD TRANSACTIONS FROM HUMO
 # ============================================================
+# TODO Production:
+# Сейчас /transactions, /dashboard и /analytics читают Telegram напрямую.
+# Это нормально для MVP, но плохо для больших данных и старых месяцев.
+# Позже нужно сделать:
+# Telegram HUMO bot -> sync -> database -> dashboard/analytics.
+# Иначе limit=500 может не покрыть старые месяцы.
 
 async def load_transactions_from_humo(
     x_session_token: str,
@@ -924,11 +1155,12 @@ async def get_dashboard(
 
         try:
             year, mon = int(month[:4]), int(month[5:7])
-            date(year, mon, 1)  # валидация
+            selected_month_date = date(year, mon, 1)
+            current_month_date = date(today.year, today.month, 1)
         except Exception:
             raise HTTPException(status_code=400, detail="Неверный формат month. Используйте YYYY-MM")
 
-        if month > current_month:
+        if selected_month_date > current_month_date:
             raise HTTPException(status_code=400, detail="Нельзя запрашивать будущий месяц")
 
         month_title = f"{RU_MONTHS[mon]} {year}"
@@ -958,7 +1190,7 @@ async def get_dashboard(
             "screen": "dashboard",
             "month": month,
             "month_title": month_title,
-            "can_go_next_month": month < current_month,
+            "can_go_next_month": selected_month_date < current_month_date,
             "can_go_previous_month": True,
             "currency": "UZS",
             "summary": current_summary,
@@ -1028,3 +1260,21 @@ async def get_analytics(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================
+# БЛОК 8: GET /kanban/categories
+# ============================================================
+
+@app.get("/kanban/categories")
+async def get_kanban_categories():
+    """
+    Категории для будущего экрана 'Разбор расходов'.
+
+    Сейчас backend только отдаёт список базовых категорий.
+    Overrides/rules/notes будут отдельным этапом, когда появится database.
+    """
+    return {
+        "success": True,
+        "categories": KANBAN_CATEGORIES,
+    }
