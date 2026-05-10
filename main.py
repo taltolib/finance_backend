@@ -993,6 +993,70 @@ async def send_code(req: PhoneRequest):
             except Exception:
                 pass
 
+@app.post("/auth/verify-code")
+async def verify_code(req: CodeRequest):
+    pending = pending_logins.get(req.phone)
+    if not pending:
+        raise HTTPException(status_code=400, detail="Сначала запросите код")
+
+    client = None
+    try:
+        client = TelegramClient(StringSession(pending["session"]), API_ID, API_HASH)
+        await client.connect()
+
+        try:
+            await client.sign_in(
+                phone=req.phone,
+                code=req.code,
+                phone_code_hash=req.phone_code_hash
+            )
+        except SessionPasswordNeededError:
+            if not req.password:
+                await client.disconnect()
+                raise HTTPException(
+                    status_code=401,
+                    detail="TWO_STEP_PASSWORD_REQUIRED"
+                )
+            await client.sign_in(password=req.password)
+
+        session_token = client.session.save()
+        me = await client.get_me()
+
+        photo_base64 = None
+        try:
+            photo_bytes = await client.download_profile_photo(me, file=bytes)
+            if photo_bytes:
+                photo_base64 = base64.b64encode(photo_bytes).decode("utf-8")
+        except Exception:
+            pass
+
+        del pending_logins[req.phone]
+
+        return {
+            "success": True,
+            "session_token": session_token,
+            "user": {
+                "id": me.id,
+                "name": f"{me.first_name or ''} {me.last_name or ''}".strip(),
+                "first_name": me.first_name or "",
+                "last_name": me.last_name or "",
+                "username": me.username,
+                "phone": req.phone,
+                "photo_base64": photo_base64,
+            }
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        if client:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+
 @app.get("/auth/me")
 async def get_me(x_session_token: str = Header(...)):
     client = None
