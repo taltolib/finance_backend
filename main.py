@@ -952,21 +952,6 @@ async def debug_env():
     }
 
 
-@app.post("/auth/send-code")
-async def send_code(req: PhoneRequest):
-    try:
-        client = TelegramClient(StringSession(), API_ID, API_HASH)
-        await client.connect()
-        result = await client.send_code_request(req.phone)
-        session_string = client.session.save()
-        pending_logins[req.phone] = {
-            "session": session_string,
-            "phone_code_hash": result.phone_code_hash
-        }
-        await client.disconnect()
-        return {"success": True, "phone_code_hash": result.phone_code_hash, "message": "Код отправлен в Telegram"}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.post("/auth/send-code")
