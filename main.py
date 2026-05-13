@@ -1,7 +1,9 @@
 """
 Finance App Backend
-Читает сообщения из @HUMOcardbot через Telegram Userbot
-и отдаёт транзакции Flutter приложению через REST API
+Reads messages from @HUMOcardbot via Telegram Userbot
+Returns transactions to Flutter app via REST API
+
+v2: Added SQLite persistence, Kanban board, transaction sync
 """
 
 # ============================================================
@@ -18,9 +20,12 @@ import re
 import os
 import base64
 import hashlib
+import sqlite3
+import uuid
 from datetime import datetime, date, timedelta
 from typing import Optional, List
 from calendar import monthrange
+from contextlib import contextmanager
 
 app = FastAPI(title="Finance App API")
 
@@ -34,8 +39,13 @@ app.add_middleware(
 API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
 API_HASH = os.getenv("TELEGRAM_API_HASH", "")
 
-user_sessions: dict[str, str] = {}
-pending_logins: dict[str, dict] = {}
+# TODO: implement AES encryption using SESSION_ENCRYPTION_KEY
+# SESSION_ENCRYPTION_KEY = os.getenv("SESSION_ENCRYPTION_KEY", "")
+# For now, session is stored as-is but NEVER logged
+
+DB_PATH = os.getenv("FINANCE_DB_PATH", "finance_app.db")
+
+pending_logins: dict[str, dict] = {}  # in-memory OTP pending
 
 # ============================================================
 # БЛОК 2: КОНСТАНТЫ
@@ -71,21 +81,260 @@ CATEGORY_RULES = [
     ("cash",      "Наличные",  ["atm", "банкомат", "снятие", "cash"]),
     ("shopping",  "Покупки",   ["uzum", "olx", "wildberries", "aliexpress", "shop"]),
 ]
-KANBAN_CATEGORIES = [
-    {"id": "uncategorized", "title": "Неразобранные"},
-    {"id": "food", "title": "Еда"},
-    {"id": "transport", "title": "Транспорт"},
-    {"id": "market", "title": "Магазины"},
-    {"id": "transfer", "title": "Переводы"},
-    {"id": "subscription", "title": "Подписки"},
-    {"id": "cash", "title": "Наличные"},
-    {"id": "shopping", "title": "Покупки"},
-    {"id": "mobile", "title": "Связь"},
-    {"id": "other", "title": "Другое"},
-    {"id": "ignored", "title": "Игнорировать"},
+
+KANBAN_SYSTEM_COLUMNS = [
+    {"id": "uncategorized", "title": "Неразобранные", "is_system": True, "position": 0},
 ]
+
 # ============================================================
-# МОДЕЛИ
+# БЛОК 3: DATABASE
+# ============================================================
+
+@contextmanager
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def init_db():
+    with get_db() as conn:
+        conn.executescript("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            telegram_user_id INTEGER UNIQUE,
+            phone TEXT,
+            name TEXT,
+            first_name TEXT,
+            last_name TEXT,
+            username TEXT,
+            photo_base64 TEXT,
+            session_token_encrypted TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS transactions (
+            id TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            telegram_message_id INTEGER,
+            tx_datetime TEXT,
+            tx_date TEXT,
+            tx_time TEXT,
+            amount REAL NOT NULL,
+            currency TEXT NOT NULL DEFAULT 'UZS',
+            type TEXT NOT NULL CHECK(type IN ('income','expense')),
+            title TEXT,
+            description TEXT,
+            merchant TEXT,
+            card_name TEXT,
+            card_last4 TEXT,
+            balance REAL,
+            balance_currency TEXT,
+            icon TEXT,
+            category_id TEXT DEFAULT 'uncategorized',
+            category_title TEXT DEFAULT 'Неразобранные',
+            raw_text TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_transactions_user_datetime ON transactions(user_id, tx_datetime);
+        CREATE INDEX IF NOT EXISTS idx_transactions_user_month ON transactions(user_id, tx_date);
+        CREATE INDEX IF NOT EXISTS idx_transactions_user_type ON transactions(user_id, type);
+
+        CREATE TABLE IF NOT EXISTS kanban_boards (
+            id TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            month TEXT NOT NULL,
+            title TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN ('active','archived')),
+            created_at TEXT NOT NULL,
+            archived_at TEXT,
+            UNIQUE(user_id, month)
+        );
+
+        CREATE TABLE IF NOT EXISTS kanban_columns (
+            id TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            board_id TEXT NOT NULL,
+            title TEXT NOT NULL,
+            is_system INTEGER NOT NULL DEFAULT 0,
+            position INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(board_id) REFERENCES kanban_boards(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS kanban_cards (
+            id TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            board_id TEXT NOT NULL,
+            transaction_id TEXT NOT NULL,
+            column_id TEXT NOT NULL,
+            position INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(user_id, board_id, transaction_id),
+            FOREIGN KEY(board_id) REFERENCES kanban_boards(id),
+            FOREIGN KEY(transaction_id) REFERENCES transactions(id),
+            FOREIGN KEY(column_id) REFERENCES kanban_columns(id)
+        );
+        """)
+
+
+@app.on_event("startup")
+async def startup():
+    init_db()
+
+
+# ============================================================
+# БЛОК 4: DB HELPERS — USERS
+# ============================================================
+
+def upsert_user(telegram_user_id: int, phone: str, name: str, first_name: str,
+                last_name: str, username: str, photo_base64: Optional[str],
+                session_token: str) -> int:
+    now = datetime.utcnow().isoformat()
+    with get_db() as conn:
+        existing = conn.execute(
+            "SELECT id FROM users WHERE telegram_user_id=?", (telegram_user_id,)
+        ).fetchone()
+        if existing:
+            conn.execute("""
+                UPDATE users SET phone=?, name=?, first_name=?, last_name=?, username=?,
+                photo_base64=COALESCE(?, photo_base64),
+                session_token_encrypted=?, updated_at=?
+                WHERE telegram_user_id=?
+            """, (phone, name, first_name, last_name, username, photo_base64,
+                  session_token, now, telegram_user_id))
+            return existing["id"]
+        else:
+            conn.execute("""
+                INSERT INTO users (telegram_user_id, phone, name, first_name, last_name,
+                username, photo_base64, session_token_encrypted, created_at, updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?)
+            """, (telegram_user_id, phone, name, first_name, last_name, username,
+                  photo_base64, session_token, now, now))
+            return conn.execute(
+                "SELECT id FROM users WHERE telegram_user_id=?", (telegram_user_id,)
+            ).fetchone()["id"]
+
+
+def get_user_by_session(session_token: str) -> Optional[dict]:
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT * FROM users WHERE session_token_encrypted=?", (session_token,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+# ============================================================
+# БЛОК 5: DB HELPERS — TRANSACTIONS
+# ============================================================
+
+def upsert_transaction(user_id: int, tx: dict) -> None:
+    now = datetime.utcnow().isoformat()
+    with get_db() as conn:
+        existing = conn.execute(
+            "SELECT id, category_id, category_title FROM transactions WHERE id=?", (tx["id"],)
+        ).fetchone()
+
+        if existing:
+            # Don't overwrite manually-set category
+            cat_id = existing["category_id"]
+            cat_title = existing["category_title"]
+            conn.execute("""
+                UPDATE transactions SET
+                    telegram_message_id=?, tx_datetime=?, tx_date=?, tx_time=?,
+                    amount=?, currency=?, type=?, title=?, description=?,
+                    merchant=?, card_name=?, card_last4=?, balance=?, balance_currency=?,
+                    icon=?, raw_text=?, updated_at=?
+                WHERE id=?
+            """, (
+                tx.get("telegram_message_id"), tx.get("datetime"), tx.get("date"), tx.get("time"),
+                tx["amount"], tx["currency"], tx["type"], tx.get("title"), tx.get("description"),
+                tx.get("merchant"), tx.get("card_name"), tx.get("card_last4"),
+                tx.get("balance"), tx.get("balance_currency"), tx.get("icon"),
+                tx.get("raw_text", "")[:500], now, tx["id"]
+            ))
+        else:
+            cat_id = tx.get("category", "uncategorized")
+            cat_title = tx.get("category_title", "Неразобранные")
+            conn.execute("""
+                INSERT INTO transactions (
+                    id, user_id, telegram_message_id, tx_datetime, tx_date, tx_time,
+                    amount, currency, type, title, description, merchant, card_name,
+                    card_last4, balance, balance_currency, icon, category_id, category_title,
+                    raw_text, created_at, updated_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (
+                tx["id"], user_id, tx.get("telegram_message_id"),
+                tx.get("datetime"), tx.get("date"), tx.get("time"),
+                tx["amount"], tx["currency"], tx["type"],
+                tx.get("title"), tx.get("description"), tx.get("merchant"),
+                tx.get("card_name"), tx.get("card_last4"),
+                tx.get("balance"), tx.get("balance_currency"),
+                tx.get("icon"), cat_id, cat_title,
+                tx.get("raw_text", "")[:500],
+                now, now
+            ))
+
+
+def db_tx_to_dict(row) -> dict:
+    r = dict(row)
+    return {
+        "id": r["id"],
+        "telegram_message_id": r.get("telegram_message_id"),
+        "date": r.get("tx_date"),
+        "time": r.get("tx_time"),
+        "datetime": r.get("tx_datetime"),
+        "amount": r["amount"],
+        "currency": r["currency"],
+        "type": r["type"],
+        "title": r.get("title"),
+        "description": r.get("description"),
+        "merchant": r.get("merchant"),
+        "card_name": r.get("card_name"),
+        "card_last4": r.get("card_last4"),
+        "balance": r.get("balance"),
+        "balance_currency": r.get("balance_currency"),
+        "icon": r.get("icon"),
+        "category": r.get("category_id"),
+        "category_title": r.get("category_title"),
+        "raw_text": r.get("raw_text", ""),
+    }
+
+
+def get_user_transactions(user_id: int, start: Optional[date] = None,
+                          end: Optional[date] = None) -> list:
+    with get_db() as conn:
+        if start and end:
+            rows = conn.execute("""
+                SELECT * FROM transactions
+                WHERE user_id=? AND tx_date >= ? AND tx_date <= ?
+                ORDER BY tx_datetime DESC, tx_date DESC
+            """, (user_id, start.isoformat(), end.isoformat())).fetchall()
+        else:
+            rows = conn.execute("""
+                SELECT * FROM transactions WHERE user_id=?
+                ORDER BY tx_datetime DESC, tx_date DESC
+            """, (user_id,)).fetchall()
+        return [db_tx_to_dict(r) for r in rows]
+
+
+# ============================================================
+# БЛОК 6: PYDANTIC МОДЕЛИ
 # ============================================================
 
 class PhoneRequest(BaseModel):
@@ -118,8 +367,23 @@ class Transaction(BaseModel):
     category_title: Optional[str] = None
     raw_text: str
 
+class CreateColumnRequest(BaseModel):
+    board_id: str
+    title: str
+
+class RenameColumnRequest(BaseModel):
+    title: str
+
+class MoveCardRequest(BaseModel):
+    board_id: str
+    transaction_id: str
+    from_column_id: str
+    to_column_id: str
+    new_index: int = 0
+
+
 # ============================================================
-# ПАРСЕР СООБЩЕНИЙ HUMO БОТА
+# БЛОК 7: ПАРСЕР СООБЩЕНИЙ HUMO БОТА
 # ============================================================
 
 def parse_uzs_amount(value: str) -> Optional[float]:
@@ -283,8 +547,9 @@ def parse_humo_message(text: str, message_id: Optional[int] = None) -> Optional[
         raw_text=text[:500]
     )
 
+
 # ============================================================
-# АНАЛИЗ СОСТОЯНИЯ HUMO БОТА
+# БЛОК 8: АНАЛИЗ СОСТОЯНИЯ HUMO БОТА
 # ============================================================
 
 def analyze_humo_connection_state(messages) -> dict:
@@ -366,20 +631,21 @@ def analyze_humo_connection_state(messages) -> dict:
     unique_signals = list(set(matched_signals))
 
     if no_card_or_account and not card_connected:
-        return {"has_bot_started": has_bot_started, "is_registered": False, "is_card_connected": False, "can_read_transactions": False, "status": "no_card_or_account_for_phone", "reason": "HUMO bot сообщил что карта не найдена для этого номера", "matched_signals": unique_signals}
+        return {"has_bot_started": has_bot_started, "is_registered": False, "is_card_connected": False, "has_humo_account_for_phone": False, "can_read_transactions": False, "status": "no_card_or_account_for_phone", "reason": "HUMO bot сообщил что карта не найдена для этого номера", "matched_signals": unique_signals}
     if card_connected:
-        return {"has_bot_started": True, "is_registered": True, "is_card_connected": True, "can_read_transactions": True, "status": "card_connected", "reason": "Поздравление от HUMO bot получено — карта подключена" if congratulations_found else "Карта HUMO найдена в сообщениях", "matched_signals": unique_signals}
+        return {"has_bot_started": True, "is_registered": True, "is_card_connected": True, "has_humo_account_for_phone": True, "can_read_transactions": True, "status": "card_connected", "reason": "Поздравление от HUMO bot получено — карта подключена" if congratulations_found else "Карта HUMO найдена в сообщениях", "matched_signals": unique_signals}
     if sms_code_invalid:
-        return {"has_bot_started": has_bot_started, "is_registered": False, "is_card_connected": False, "can_read_transactions": False, "status": "sms_code_invalid", "reason": "Неверный SMS-код", "matched_signals": unique_signals}
+        return {"has_bot_started": has_bot_started, "is_registered": False, "is_card_connected": False, "has_humo_account_for_phone": False, "can_read_transactions": False, "status": "sms_code_invalid", "reason": "Неверный SMS-код", "matched_signals": unique_signals}
     if sms_code_waiting:
-        return {"has_bot_started": has_bot_started, "is_registered": False, "is_card_connected": False, "can_read_transactions": False, "status": "sms_code_waiting", "reason": "HUMO bot ждёт SMS-код", "matched_signals": unique_signals}
+        return {"has_bot_started": has_bot_started, "is_registered": False, "is_card_connected": False, "has_humo_account_for_phone": False, "can_read_transactions": False, "status": "sms_code_waiting", "reason": "HUMO bot ждёт SMS-код", "matched_signals": unique_signals}
     if phone_requested:
-        return {"has_bot_started": has_bot_started, "is_registered": False, "is_card_connected": False, "can_read_transactions": False, "status": "phone_required", "reason": "HUMO bot просит номер телефона", "matched_signals": unique_signals}
+        return {"has_bot_started": has_bot_started, "is_registered": False, "is_card_connected": False, "has_humo_account_for_phone": False, "can_read_transactions": False, "status": "phone_required", "reason": "HUMO bot просит номер телефона", "matched_signals": unique_signals}
 
-    return {"has_bot_started": has_bot_started, "is_registered": False, "is_card_connected": False, "can_read_transactions": False, "status": "started_not_registered" if has_bot_started else "not_started", "reason": "Бот запущен но карта не подключена" if has_bot_started else "Бот не запускался", "matched_signals": unique_signals}
+    return {"has_bot_started": has_bot_started, "is_registered": False, "is_card_connected": False, "has_humo_account_for_phone": False, "can_read_transactions": False, "status": "started_not_registered" if has_bot_started else "not_started", "reason": "Бот запущен но карта не подключена" if has_bot_started else "Бот не запускался", "matched_signals": unique_signals}
+
 
 # ============================================================
-# БЛОК 3: HELPER FUNCTIONS
+# БЛОК 9: HELPER FUNCTIONS
 # ============================================================
 
 def detect_category(tx: dict) -> tuple:
@@ -397,17 +663,6 @@ def detect_category(tx: dict) -> tuple:
 
 
 def parse_transaction_datetime(tx: dict) -> Optional[datetime]:
-    """
-    Надёжно превращает transaction date/time в datetime.
-
-    Поддерживает:
-    - tx["datetime"] = "2026-05-01T11:01:00"
-    - tx["date"] = "01.05.2026" + tx["time"] = "11:01"
-    - tx["date"] = "01-05-2026"
-    - tx["date"] = "01/05/2026"
-
-    Если time нет, используется 00:00.
-    """
     if not tx:
         return None
 
@@ -424,18 +679,11 @@ def parse_transaction_datetime(tx: dict) -> Optional[datetime]:
 
     time_value = tx.get("time") or "00:00"
 
-    date_formats = [
-        "%d.%m.%Y",
-        "%d-%m-%Y",
-        "%d/%m/%Y",
-    ]
+    date_formats = ["%d.%m.%Y", "%d-%m-%Y", "%d/%m/%Y", "%Y-%m-%d"]
 
     for date_format in date_formats:
         try:
-            return datetime.strptime(
-                f"{date_value} {time_value}",
-                f"{date_format} %H:%M"
-            )
+            return datetime.strptime(f"{date_value} {time_value}", f"{date_format} %H:%M")
         except Exception:
             continue
 
@@ -446,6 +694,7 @@ def parse_transaction_datetime(tx: dict) -> Optional[datetime]:
             continue
 
     return None
+
 
 def normalize_transaction(tx: dict) -> dict:
     cat_id, cat_title = detect_category(tx)
@@ -463,47 +712,30 @@ def get_month_range(month: str) -> tuple:
 
 
 def get_period_range(period: str) -> tuple:
-    """
-    Возвращает date range для analytics.
-
-    day      -> сегодня
-    week     -> текущая неделя с понедельника до сегодня
-    month    -> текущий месяц с 1 числа до сегодня
-    3months  -> последние 3 календарных месяца, включая текущий
-    year     -> текущий год с 1 января до сегодня
-    """
     today = date.today()
 
     if period == "day":
         return today, today
-
     if period == "week":
         start = today - timedelta(days=today.weekday())
         return start, today
-
     if period == "month":
         start = date(today.year, today.month, 1)
         return start, today
-
     if period == "3months":
         start_month = today.month - 2
         start_year = today.year
-
         while start_month <= 0:
             start_month += 12
             start_year -= 1
-
         start = date(start_year, start_month, 1)
         return start, today
-
     if period == "year":
         start = date(today.year, 1, 1)
         return start, today
 
-    # fallback, если кто-то отправил мусор, хотя /analytics уже валидирует period
     start = today - timedelta(days=7)
     return start, today
-
 
 
 def filter_transactions_by_date_range(transactions: list, start: date, end: date) -> list:
@@ -610,16 +842,11 @@ def get_top_expense(transactions: list) -> Optional[dict]:
 
 
 def get_last_balance(transactions: list) -> Optional[dict]:
-    """
-    Берёт баланс из самой новой транзакции, где balance != None.
-    Это баланс по последней операции, не гарантированно текущий банковский баланс.
-    """
     sorted_transactions = sorted(
         transactions,
         key=lambda tx: parse_transaction_datetime(tx) or datetime.min,
         reverse=True
     )
-
     for tx in sorted_transactions:
         if tx.get("balance") is not None:
             return {
@@ -630,7 +857,6 @@ def get_last_balance(transactions: list) -> Optional[dict]:
                 "time": tx.get("time"),
                 "datetime": tx.get("datetime"),
             }
-
     return None
 
 
@@ -662,25 +888,6 @@ def build_month_insight(current: dict, previous: Optional[dict]) -> dict:
 
 
 def build_chart(transactions: list, period: str, start: date, end: date) -> list:
-    """
-    Строит chart для analytics.
-
-    day:
-      24 точки по часам.
-
-    week:
-      7 дней текущей недели, даже если end=today.
-
-    month:
-      все дни от start до end.
-
-    3months:
-      по месяцам от start до end.
-
-    year:
-      все 12 месяцев текущего года.
-    """
-
     def add_amount(point: dict, tx: dict) -> None:
         amount = tx.get("amount", 0) or 0
         if tx.get("type") == "income":
@@ -690,179 +897,88 @@ def build_chart(transactions: list, period: str, start: date, end: date) -> list
 
     if period == "day":
         chart = {
-            h: {
-                "label": f"{h:02d}:00",
-                "date": start.isoformat(),
-                "income": 0.0,
-                "expense": 0.0,
-            }
+            h: {"label": f"{h:02d}:00", "date": start.isoformat(), "income": 0.0, "expense": 0.0}
             for h in range(24)
         }
-
         for tx in transactions:
             dt = parse_transaction_datetime(tx)
             if not dt:
                 continue
             add_amount(chart[dt.hour], tx)
-
-        return [
-            {
-                "label": item["label"],
-                "date": item["date"],
-                "income": round(item["income"], 2),
-                "expense": round(item["expense"], 2),
-            }
-            for item in chart.values()
-        ]
+        return [{"label": item["label"], "date": item["date"], "income": round(item["income"], 2), "expense": round(item["expense"], 2)} for item in chart.values()]
 
     if period == "week":
-        week_start = start
         week_end = start + timedelta(days=6)
-
         chart = {}
-        current = week_start
-
+        current = start
         while current <= week_end:
             key = current.isoformat()
-            chart[key] = {
-                "label": RU_WEEKDAYS_SHORT[current.weekday()],
-                "date": key,
-                "income": 0.0,
-                "expense": 0.0,
-            }
+            chart[key] = {"label": RU_WEEKDAYS_SHORT[current.weekday()], "date": key, "income": 0.0, "expense": 0.0}
             current += timedelta(days=1)
-
         for tx in transactions:
             dt = parse_transaction_datetime(tx)
             if not dt:
                 continue
-
             key = dt.date().isoformat()
             if key in chart:
                 add_amount(chart[key], tx)
-
-        return [
-            {
-                "label": item["label"],
-                "date": item["date"],
-                "income": round(item["income"], 2),
-                "expense": round(item["expense"], 2),
-            }
-            for item in chart.values()
-        ]
+        return [{"label": item["label"], "date": item["date"], "income": round(item["income"], 2), "expense": round(item["expense"], 2)} for item in chart.values()]
 
     if period == "month":
         chart = {}
         current = start
-
         while current <= end:
             key = current.isoformat()
-            chart[key] = {
-                "label": str(current.day),
-                "date": key,
-                "income": 0.0,
-                "expense": 0.0,
-            }
+            chart[key] = {"label": str(current.day), "date": key, "income": 0.0, "expense": 0.0}
             current += timedelta(days=1)
-
         for tx in transactions:
             dt = parse_transaction_datetime(tx)
             if not dt:
                 continue
-
             key = dt.date().isoformat()
             if key in chart:
                 add_amount(chart[key], tx)
-
-        return [
-            {
-                "label": item["label"],
-                "date": item["date"],
-                "income": round(item["income"], 2),
-                "expense": round(item["expense"], 2),
-            }
-            for item in chart.values()
-        ]
+        return [{"label": item["label"], "date": item["date"], "income": round(item["income"], 2), "expense": round(item["expense"], 2)} for item in chart.values()]
 
     if period == "3months":
         chart = {}
         current = date(start.year, start.month, 1)
-
         while current <= end:
             key = current.strftime("%Y-%m")
-            chart[key] = {
-                "label": RU_MONTHS[current.month],
-                "date": key,
-                "income": 0.0,
-                "expense": 0.0,
-            }
-
+            chart[key] = {"label": RU_MONTHS[current.month], "date": key, "income": 0.0, "expense": 0.0}
             if current.month == 12:
                 current = date(current.year + 1, 1, 1)
             else:
                 current = date(current.year, current.month + 1, 1)
-
         for tx in transactions:
             dt = parse_transaction_datetime(tx)
             if not dt:
                 continue
-
             key = dt.strftime("%Y-%m")
             if key in chart:
                 add_amount(chart[key], tx)
-
-        return [
-            {
-                "label": item["label"],
-                "date": item["date"],
-                "income": round(item["income"], 2),
-                "expense": round(item["expense"], 2),
-            }
-            for item in chart.values()
-        ]
+        return [{"label": item["label"], "date": item["date"], "income": round(item["income"], 2), "expense": round(item["expense"], 2)} for item in chart.values()]
 
     if period == "year":
         chart = {}
-
         for month_num in range(1, 13):
             key = f"{start.year}-{month_num:02d}"
-            chart[key] = {
-                "label": RU_MONTHS[month_num],
-                "date": key,
-                "income": 0.0,
-                "expense": 0.0,
-            }
-
+            chart[key] = {"label": RU_MONTHS[month_num], "date": key, "income": 0.0, "expense": 0.0}
         for tx in transactions:
             dt = parse_transaction_datetime(tx)
             if not dt:
                 continue
-
             key = dt.strftime("%Y-%m")
             if key in chart:
                 add_amount(chart[key], tx)
-
-        return [
-            {
-                "label": item["label"],
-                "date": item["date"],
-                "income": round(item["income"], 2),
-                "expense": round(item["expense"], 2),
-            }
-            for item in chart.values()
-        ]
+        return [{"label": item["label"], "date": item["date"], "income": round(item["income"], 2), "expense": round(item["expense"], 2)} for item in chart.values()]
 
     return []
 
+
 # ============================================================
-# БЛОК 4: LOAD TRANSACTIONS FROM HUMO
+# БЛОК 10: TELEGRAM — LOAD & SYNC
 # ============================================================
-# TODO Production:
-# Сейчас /transactions, /dashboard и /analytics читают Telegram напрямую.
-# Это нормально для MVP, но плохо для больших данных и старых месяцев.
-# Позже нужно сделать:
-# Telegram HUMO bot -> sync -> database -> dashboard/analytics.
-# Иначе limit=500 может не покрыть старые месяцы.
 
 async def load_transactions_from_humo(
     x_session_token: str,
@@ -899,7 +1015,6 @@ async def load_transactions_from_humo(
 
             if "история платежей" in text.lower():
                 continue
-
             if text.count("➖") + text.count("➕") > 1:
                 continue
 
@@ -931,8 +1046,231 @@ async def load_transactions_from_humo(
                 pass
 
 
+async def sync_transactions_for_user(x_session_token: str, limit: int = 500) -> dict:
+    """
+    Pull fresh transactions from HUMO bot and upsert to DB.
+    Returns sync stats.
+    """
+    user = get_user_by_session(x_session_token)
+    if not user:
+        raise HTTPException(status_code=401, detail="SESSION_NOT_FOUND")
+
+    result = await load_transactions_from_humo(x_session_token, limit=limit)
+    transactions = result["transactions"]
+
+    new_count = 0
+    updated_count = 0
+
+    for tx in transactions:
+        with get_db() as conn:
+            existing = conn.execute(
+                "SELECT id FROM transactions WHERE id=?", (tx["id"],)
+            ).fetchone()
+        if existing:
+            updated_count += 1
+        else:
+            new_count += 1
+        upsert_transaction(user["id"], tx)
+
+    return {
+        "success": True,
+        "synced": len(transactions),
+        "new": new_count,
+        "updated": updated_count,
+        "has_more": result["has_more"],
+        "next_offset_id": result["next_offset_id"],
+    }
+
+
 # ============================================================
-# ЭНДПОИНТЫ
+# БЛОК 11: KANBAN HELPERS
+# ============================================================
+
+def ensure_current_board(user_id: int, month: str) -> dict:
+    """
+    Archive older active boards for this user.
+    Create current month board if missing.
+    Ensure system uncategorized column.
+    Copy custom columns from latest previous board if current board is new.
+    Returns the current board row as dict.
+    """
+    now = datetime.utcnow().isoformat()
+    year, mon = int(month[:4]), int(month[5:7])
+    month_title = f"{RU_MONTHS[mon]} {year}"
+
+    with get_db() as conn:
+        # Archive any active boards that are not the current month
+        conn.execute("""
+            UPDATE kanban_boards SET status='archived', archived_at=?
+            WHERE user_id=? AND status='active' AND month != ?
+        """, (now, user_id, month))
+
+        # Get or create current board
+        board = conn.execute(
+            "SELECT * FROM kanban_boards WHERE user_id=? AND month=?", (user_id, month)
+        ).fetchone()
+
+        is_new_board = board is None
+
+        if is_new_board:
+            board_id = month  # e.g. "2026-05"
+            conn.execute("""
+                INSERT INTO kanban_boards (id, user_id, month, title, status, created_at)
+                VALUES (?,?,?,?,?,?)
+            """, (board_id, user_id, month, month_title, "active", now))
+            board = conn.execute(
+                "SELECT * FROM kanban_boards WHERE id=?", (board_id,)
+            ).fetchone()
+        else:
+            board_id = board["id"]
+            # ensure status is active if it's the current month
+            conn.execute(
+                "UPDATE kanban_boards SET status='active' WHERE id=?", (board_id,)
+            )
+
+        # Ensure system uncategorized column exists
+        uncategorized = conn.execute(
+            "SELECT id FROM kanban_columns WHERE board_id=? AND is_system=1", (board_id,)
+        ).fetchone()
+
+        if not uncategorized:
+            conn.execute("""
+                INSERT INTO kanban_columns (id, user_id, board_id, title, is_system, position, created_at, updated_at)
+                VALUES (?,?,?,?,?,?,?,?)
+            """, (f"{board_id}:uncategorized", user_id, board_id, "Неразобранные", 1, 0, now, now))
+
+        # Copy custom columns from latest previous board if this is a new board
+        if is_new_board:
+            prev_board = conn.execute("""
+                SELECT id FROM kanban_boards
+                WHERE user_id=? AND month < ?
+                ORDER BY month DESC LIMIT 1
+            """, (user_id, month)).fetchone()
+
+            if prev_board:
+                prev_columns = conn.execute("""
+                    SELECT * FROM kanban_columns
+                    WHERE board_id=? AND is_system=0
+                    ORDER BY position ASC
+                """, (prev_board["id"],)).fetchall()
+
+                for col in prev_columns:
+                    new_col_id = str(uuid.uuid4())
+                    conn.execute("""
+                        INSERT INTO kanban_columns (id, user_id, board_id, title, is_system, position, created_at, updated_at)
+                        VALUES (?,?,?,?,?,?,?,?)
+                    """, (new_col_id, user_id, board_id, col["title"], 0, col["position"], now, now))
+
+        return dict(board)
+
+
+def ensure_kanban_cards_for_month(user_id: int, board_id: str, month: str) -> None:
+    """
+    Make sure all expense transactions for this month have a kanban_card.
+    New cards land in the uncategorized system column.
+    """
+    now = datetime.utcnow().isoformat()
+    year, mon = int(month[:4]), int(month[5:7])
+    start = date(year, mon, 1)
+    last_day = monthrange(year, mon)[1]
+    end = date(year, mon, last_day)
+
+    system_col_id = f"{board_id}:uncategorized"
+
+    with get_db() as conn:
+        # Get all expense transactions for the month not yet in kanban_cards
+        expenses = conn.execute("""
+            SELECT t.id FROM transactions t
+            WHERE t.user_id=?
+              AND t.type='expense'
+              AND t.tx_date >= ? AND t.tx_date <= ?
+              AND NOT EXISTS (
+                SELECT 1 FROM kanban_cards k
+                WHERE k.transaction_id = t.id AND k.board_id = ?
+              )
+        """, (user_id, start.isoformat(), end.isoformat(), board_id)).fetchall()
+
+        for tx in expenses:
+            card_id = str(uuid.uuid4())
+            # Get current max position in uncategorized
+            max_pos = conn.execute(
+                "SELECT COALESCE(MAX(position), -1) FROM kanban_cards WHERE column_id=?",
+                (system_col_id,)
+            ).fetchone()[0]
+            conn.execute("""
+                INSERT OR IGNORE INTO kanban_cards (id, user_id, board_id, transaction_id, column_id, position, created_at, updated_at)
+                VALUES (?,?,?,?,?,?,?,?)
+            """, (card_id, user_id, board_id, tx["id"], system_col_id, max_pos + 1, now, now))
+
+
+def get_board_with_columns(user_id: int, board_id: str) -> dict:
+    with get_db() as conn:
+        board = conn.execute(
+            "SELECT * FROM kanban_boards WHERE id=? AND user_id=?", (board_id, user_id)
+        ).fetchone()
+        if not board:
+            return None
+
+        columns = conn.execute("""
+            SELECT * FROM kanban_columns WHERE board_id=? AND user_id=?
+            ORDER BY position ASC, is_system DESC
+        """, (board_id, user_id)).fetchall()
+
+        result_columns = []
+        for col in columns:
+            cards_rows = conn.execute("""
+                SELECT k.*, t.amount, t.currency, t.tx_date, t.tx_time, t.merchant, t.title, t.description
+                FROM kanban_cards k
+                JOIN transactions t ON t.id = k.transaction_id
+                WHERE k.column_id=? AND k.board_id=?
+                ORDER BY k.position ASC
+            """, (col["id"], board_id)).fetchall()
+
+            cards = []
+            expense_total = 0.0
+            for card in cards_rows:
+                expense_total += card["amount"] or 0
+                cards.append({
+                    "id": card["id"],
+                    "transaction_id": card["transaction_id"],
+                    "place": card["merchant"] or card["title"] or card["description"],
+                    "amount": card["amount"],
+                    "currency": card["currency"],
+                    "date": card["tx_date"],
+                    "time": card["tx_time"],
+                    "merchant": card["merchant"],
+                    "column_id": card["column_id"],
+                })
+
+            result_columns.append({
+                "id": col["id"],
+                "title": col["title"],
+                "is_system": bool(col["is_system"]),
+                "position": col["position"],
+                "transactions_count": len(cards),
+                "expense_total": round(expense_total, 2),
+                "cards": cards,
+            })
+
+        total_expense = sum(c["expense_total"] for c in result_columns)
+        total_cards = sum(c["transactions_count"] for c in result_columns)
+
+        return {
+            "id": board["id"],
+            "month": board["month"],
+            "title": board["title"],
+            "status": board["status"],
+            "columns": result_columns,
+            "summary": {
+                "expense_total": round(total_expense, 2),
+                "transactions_count": total_cards,
+                "columns_count": len(result_columns),
+            }
+        }
+
+
+# ============================================================
+# БЛОК 12: AUTH ENDPOINTS
 # ============================================================
 
 @app.get("/")
@@ -952,8 +1290,6 @@ async def debug_env():
     }
 
 
-
-
 @app.post("/auth/send-code")
 async def send_code(req: PhoneRequest):
     client = None
@@ -962,8 +1298,9 @@ async def send_code(req: PhoneRequest):
         await client.connect()
 
         result = await client.send_code_request(req.phone)
-
         session_string = client.session.save()
+
+        # NOTE: never log session_string, phone_code_hash
         pending_logins[req.phone] = {
             "session": session_string,
             "phone_code_hash": result.phone_code_hash
@@ -985,13 +1322,13 @@ async def send_code(req: PhoneRequest):
 
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
-
     finally:
         if client:
             try:
                 await client.disconnect()
             except Exception:
                 pass
+
 
 @app.post("/auth/verify-code")
 async def verify_code(req: CodeRequest):
@@ -1013,10 +1350,12 @@ async def verify_code(req: CodeRequest):
         except SessionPasswordNeededError:
             if not req.password:
                 await client.disconnect()
-                raise HTTPException(
-                    status_code=401,
-                    detail="TWO_STEP_PASSWORD_REQUIRED"
-                )
+                # Return clean 200 with flag, NOT 401/500
+                return {
+                    "success": False,
+                    "requires_password": True,
+                    "message": "Введите пароль двухфакторной аутентификации"
+                }
             await client.sign_in(password=req.password)
 
         session_token = client.session.save()
@@ -1030,6 +1369,18 @@ async def verify_code(req: CodeRequest):
         except Exception:
             pass
 
+        name = f"{me.first_name or ''} {me.last_name or ''}".strip()
+        user_db_id = upsert_user(
+            telegram_user_id=me.id,
+            phone=req.phone,
+            name=name,
+            first_name=me.first_name or "",
+            last_name=me.last_name or "",
+            username=me.username or "",
+            photo_base64=photo_base64,
+            session_token=session_token,
+        )
+
         del pending_logins[req.phone]
 
         return {
@@ -1037,11 +1388,10 @@ async def verify_code(req: CodeRequest):
             "session_token": session_token,
             "user": {
                 "id": me.id,
-                "name": f"{me.first_name or ''} {me.last_name or ''}".strip(),
+                "name": name,
                 "first_name": me.first_name or "",
                 "last_name": me.last_name or "",
                 "username": me.username,
-                "phone": req.phone,
                 "photo_base64": photo_base64,
             }
         }
@@ -1057,6 +1407,7 @@ async def verify_code(req: CodeRequest):
             except Exception:
                 pass
 
+
 @app.get("/auth/me")
 async def get_me(x_session_token: str = Header(...)):
     client = None
@@ -1066,6 +1417,7 @@ async def get_me(x_session_token: str = Header(...)):
         if not await client.is_user_authorized():
             raise HTTPException(status_code=401, detail="SESSION_EXPIRED")
         me = await client.get_me()
+
         photo_base64 = None
         try:
             photo_bytes = await client.download_profile_photo(me, file=bytes)
@@ -1073,11 +1425,24 @@ async def get_me(x_session_token: str = Header(...)):
                 photo_base64 = base64.b64encode(photo_bytes).decode("utf-8")
         except Exception:
             pass
+
+        name = f"{me.first_name or ''} {me.last_name or ''}".strip()
+        upsert_user(
+            telegram_user_id=me.id,
+            phone="",
+            name=name,
+            first_name=me.first_name or "",
+            last_name=me.last_name or "",
+            username=me.username or "",
+            photo_base64=photo_base64,
+            session_token=x_session_token,
+        )
+
         return {
             "success": True,
             "user": {
                 "id": me.id,
-                "name": f"{me.first_name or ''} {me.last_name or ''}".strip(),
+                "name": name,
                 "first_name": me.first_name or "",
                 "last_name": me.last_name or "",
                 "username": me.username,
@@ -1112,6 +1477,10 @@ async def logout(x_session_token: str = Header(...)):
                 pass
 
 
+# ============================================================
+# БЛОК 13: CHECK BOT
+# ============================================================
+
 @app.get("/check-bot")
 async def check_bot(x_session_token: str = Header(...)):
     client = None
@@ -1125,7 +1494,7 @@ async def check_bot(x_session_token: str = Header(...)):
         except Exception as e:
             return {
                 "success": True, "authorized": True, "has_bot": False, "has_messages": False,
-                "humo": {"has_bot_started": False, "is_registered": False, "is_card_connected": False, "can_read_transactions": False, "status": "bot_not_found", "reason": str(e), "matched_signals": []},
+                "humo": {"has_bot_started": False, "is_registered": False, "is_card_connected": False, "has_humo_account_for_phone": False, "can_read_transactions": False, "status": "bot_not_found", "reason": str(e), "matched_signals": []},
                 "message": "HUMO bot не найден в чатах пользователя"
             }
         messages = await client.get_messages(entity, limit=100)
@@ -1145,16 +1514,61 @@ async def check_bot(x_session_token: str = Header(...)):
 
 
 # ============================================================
-# БЛОК 5: ОБНОВЛЁННЫЙ /transactions
+# БЛОК 14: TRANSACTIONS — SYNC & GET
 # ============================================================
+
+@app.post("/transactions/sync")
+async def sync_transactions(
+    x_session_token: str = Header(...),
+    limit: int = 500
+):
+    try:
+        result = await sync_transactions_for_user(x_session_token, limit=limit)
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.get("/transactions")
 async def get_transactions(
     x_session_token: str = Header(...),
     limit: int = 50,
-    offset_id: int = 0
+    offset_id: int = 0,
+    use_db: bool = True,
 ):
     try:
+        if use_db:
+            user = get_user_by_session(x_session_token)
+            if user:
+                transactions = get_user_transactions(user["id"])
+                # Paginate from DB
+                if offset_id > 0:
+                    # Find index of offset_id in message IDs and slice
+                    msg_ids = [t.get("telegram_message_id") for t in transactions]
+                    try:
+                        idx = next(i for i, mid in enumerate(msg_ids) if mid and mid <= offset_id)
+                        transactions = transactions[idx:idx + limit]
+                    except StopIteration:
+                        transactions = []
+                else:
+                    transactions = transactions[:limit]
+
+                income_total = sum(t["amount"] for t in transactions if t["type"] == "income")
+                expense_total = sum(t["amount"] for t in transactions if t["type"] == "expense")
+                return {
+                    "success": True,
+                    "count": len(transactions),
+                    "income_total": round(income_total, 2),
+                    "expense_total": round(expense_total, 2),
+                    "currency": "UZS",
+                    "has_more": False,
+                    "next_offset_id": None,
+                    "transactions": transactions,
+                }
+
+        # Fallback: read live from Telegram
         result = await load_transactions_from_humo(x_session_token, limit=limit, offset_id=offset_id)
         transactions = result["transactions"]
         income_total = sum(t["amount"] for t in transactions if t["type"] == "income")
@@ -1176,7 +1590,7 @@ async def get_transactions(
 
 
 # ============================================================
-# БЛОК 6: GET /dashboard
+# БЛОК 15: DASHBOARD
 # ============================================================
 
 @app.get("/dashboard")
@@ -1204,8 +1618,13 @@ async def get_dashboard(
         month_title = f"{RU_MONTHS[mon]} {year}"
         start_date, end_date = get_month_range(month)
 
-        result = await load_transactions_from_humo(x_session_token, limit=500)
-        all_transactions = result["transactions"]
+        # Try to serve from DB first
+        user = get_user_by_session(x_session_token)
+        if user:
+            all_transactions = get_user_transactions(user["id"])
+        else:
+            result = await load_transactions_from_humo(x_session_token, limit=500)
+            all_transactions = result["transactions"]
 
         month_transactions = filter_transactions_by_date_range(all_transactions, start_date, end_date)
         month_transactions.sort(key=lambda t: parse_transaction_datetime(t) or datetime.min, reverse=True)
@@ -1237,8 +1656,6 @@ async def get_dashboard(
             "last_balance": last_balance,
             "insight": insight,
             "transaction_groups": transaction_groups,
-            "has_more": result["has_more"],
-            "next_offset_id": result["next_offset_id"],
         }
     except HTTPException:
         raise
@@ -1247,13 +1664,13 @@ async def get_dashboard(
 
 
 # ============================================================
-# БЛОК 7: GET /analytics
+# БЛОК 16: ANALYTICS
 # ============================================================
 
 @app.get("/analytics")
 async def get_analytics(
     x_session_token: str = Header(...),
-    period: str = Query("week", description="day | week | month | 3months | year")
+    period: str = Query("day", description="day | week | month | 3months | year")
 ):
     try:
         valid_periods = ["day", "week", "month", "3months", "year"]
@@ -1262,11 +1679,14 @@ async def get_analytics(
 
         start_date, end_date = get_period_range(period)
 
-        limit_map = {"day": 100, "week": 200, "month": 300, "3months": 500, "year": 500}
-        load_limit = limit_map.get(period, 300)
-
-        result = await load_transactions_from_humo(x_session_token, limit=load_limit)
-        all_transactions = result["transactions"]
+        user = get_user_by_session(x_session_token)
+        if user:
+            all_transactions = get_user_transactions(user["id"])
+        else:
+            limit_map = {"day": 100, "week": 200, "month": 300, "3months": 500, "year": 500}
+            load_limit = limit_map.get(period, 300)
+            result = await load_transactions_from_humo(x_session_token, limit=load_limit)
+            all_transactions = result["transactions"]
 
         period_transactions = filter_transactions_by_date_range(all_transactions, start_date, end_date)
         period_transactions.sort(key=lambda t: parse_transaction_datetime(t) or datetime.min, reverse=True)
@@ -1300,19 +1720,301 @@ async def get_analytics(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# Backward-compat aliases
+@app.get("/analytics/summary")
+async def analytics_summary(
+    x_session_token: str = Header(...),
+    period: str = Query("day")
+):
+    data = await get_analytics(x_session_token=x_session_token, period=period)
+    return {"success": True, "data": data["summary"]}
+
+
+@app.get("/analytics/chart")
+async def analytics_chart(
+    x_session_token: str = Header(...),
+    period: str = Query("day")
+):
+    data = await get_analytics(x_session_token=x_session_token, period=period)
+    return {"success": True, "data": data["chart"]}
+
+
 # ============================================================
-# БЛОК 8: GET /kanban/categories
+# БЛОК 17: KANBAN ENDPOINTS
 # ============================================================
 
 @app.get("/kanban/categories")
 async def get_kanban_categories():
-    """
-    Категории для будущего экрана 'Разбор расходов'.
-
-    Сейчас backend только отдаёт список базовых категорий.
-    Overrides/rules/notes будут отдельным этапом, когда появится database.
-    """
     return {
         "success": True,
-        "categories": KANBAN_CATEGORIES,
+        "categories": [
+            {"id": "uncategorized", "title": "Неразобранные"},
+            {"id": "food", "title": "Еда"},
+            {"id": "transport", "title": "Транспорт"},
+            {"id": "market", "title": "Магазины"},
+            {"id": "transfer", "title": "Переводы"},
+            {"id": "subscription", "title": "Подписки"},
+            {"id": "cash", "title": "Наличные"},
+            {"id": "shopping", "title": "Покупки"},
+            {"id": "mobile", "title": "Связь"},
+            {"id": "other", "title": "Другое"},
+            {"id": "ignored", "title": "Игнорировать"},
+        ],
     }
+
+
+@app.get("/kanban/current")
+async def get_kanban_current(
+    x_session_token: str = Header(...),
+    month: Optional[str] = Query(None, description="YYYY-MM, default: current month")
+):
+    try:
+        today = date.today()
+        if month is None:
+            month = today.strftime("%Y-%m")
+
+        user = get_user_by_session(x_session_token)
+        if not user:
+            # Try to authenticate via Telegram and get/create user
+            raise HTTPException(status_code=401, detail="SESSION_NOT_FOUND — сначала вызови /transactions/sync")
+
+        user_id = user["id"]
+
+        # Sync fresh transactions first (light sync)
+        await sync_transactions_for_user(x_session_token, limit=300)
+
+        # Ensure board exists with correct columns
+        ensure_current_board(user_id, month)
+
+        board_id = month
+        ensure_kanban_cards_for_month(user_id, board_id, month)
+
+        board = get_board_with_columns(user_id, board_id)
+        if not board:
+            raise HTTPException(status_code=404, detail="Доска не найдена")
+
+        return {"success": True, "board": board}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/kanban/archived")
+async def get_kanban_archived(x_session_token: str = Header(...)):
+    try:
+        user = get_user_by_session(x_session_token)
+        if not user:
+            raise HTTPException(status_code=401, detail="SESSION_NOT_FOUND")
+
+        with get_db() as conn:
+            boards = conn.execute("""
+                SELECT id, month, title, status, created_at, archived_at
+                FROM kanban_boards
+                WHERE user_id=? AND status='archived'
+                ORDER BY month DESC
+            """, (user["id"],)).fetchall()
+
+        result = []
+        for b in boards:
+            bd = dict(b)
+            # Get summary for archived board
+            with get_db() as conn:
+                col_count = conn.execute(
+                    "SELECT COUNT(*) FROM kanban_columns WHERE board_id=?", (b["id"],)
+                ).fetchone()[0]
+                card_count = conn.execute(
+                    "SELECT COUNT(*) FROM kanban_cards WHERE board_id=?", (b["id"],)
+                ).fetchone()[0]
+            bd["columns_count"] = col_count
+            bd["cards_count"] = card_count
+            result.append(bd)
+
+        return {"success": True, "boards": result}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/kanban/columns")
+async def create_kanban_column(
+    req: CreateColumnRequest,
+    x_session_token: str = Header(...)
+):
+    try:
+        user = get_user_by_session(x_session_token)
+        if not user:
+            raise HTTPException(status_code=401, detail="SESSION_NOT_FOUND")
+
+        now = datetime.utcnow().isoformat()
+        col_id = str(uuid.uuid4())
+
+        with get_db() as conn:
+            board = conn.execute(
+                "SELECT * FROM kanban_boards WHERE id=? AND user_id=?",
+                (req.board_id, user["id"])
+            ).fetchone()
+            if not board:
+                raise HTTPException(status_code=404, detail="Доска не найдена")
+
+            max_pos = conn.execute(
+                "SELECT COALESCE(MAX(position), 0) FROM kanban_columns WHERE board_id=?",
+                (req.board_id,)
+            ).fetchone()[0]
+
+            conn.execute("""
+                INSERT INTO kanban_columns (id, user_id, board_id, title, is_system, position, created_at, updated_at)
+                VALUES (?,?,?,?,?,?,?,?)
+            """, (col_id, user["id"], req.board_id, req.title, 0, max_pos + 1, now, now))
+
+        return {
+            "success": True,
+            "column": {
+                "id": col_id,
+                "board_id": req.board_id,
+                "title": req.title,
+                "is_system": False,
+                "position": max_pos + 1,
+            }
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.patch("/kanban/columns/{column_id}")
+async def rename_kanban_column(
+    column_id: str,
+    req: RenameColumnRequest,
+    x_session_token: str = Header(...)
+):
+    try:
+        user = get_user_by_session(x_session_token)
+        if not user:
+            raise HTTPException(status_code=401, detail="SESSION_NOT_FOUND")
+
+        now = datetime.utcnow().isoformat()
+        with get_db() as conn:
+            col = conn.execute(
+                "SELECT * FROM kanban_columns WHERE id=? AND user_id=?",
+                (column_id, user["id"])
+            ).fetchone()
+            if not col:
+                raise HTTPException(status_code=404, detail="Колонка не найдена")
+            if col["is_system"]:
+                raise HTTPException(status_code=400, detail="Системную колонку нельзя изменить")
+            conn.execute(
+                "UPDATE kanban_columns SET title=?, updated_at=? WHERE id=?",
+                (req.title, now, column_id)
+            )
+
+        return {"success": True, "column": {"id": column_id, "title": req.title}}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/kanban/columns/{column_id}")
+async def delete_kanban_column(
+    column_id: str,
+    x_session_token: str = Header(...)
+):
+    try:
+        user = get_user_by_session(x_session_token)
+        if not user:
+            raise HTTPException(status_code=401, detail="SESSION_NOT_FOUND")
+
+        now = datetime.utcnow().isoformat()
+        with get_db() as conn:
+            col = conn.execute(
+                "SELECT * FROM kanban_columns WHERE id=? AND user_id=?",
+                (column_id, user["id"])
+            ).fetchone()
+            if not col:
+                raise HTTPException(status_code=404, detail="Колонка не найдена")
+            if col["is_system"]:
+                raise HTTPException(status_code=400, detail="Системную колонку нельзя удалить")
+
+            board_id = col["board_id"]
+            system_col = conn.execute(
+                "SELECT id FROM kanban_columns WHERE board_id=? AND is_system=1",
+                (board_id,)
+            ).fetchone()
+
+            if system_col:
+                # Move cards to uncategorized
+                conn.execute("""
+                    UPDATE kanban_cards SET column_id=?, updated_at=? WHERE column_id=?
+                """, (system_col["id"], now, column_id))
+
+            conn.execute("DELETE FROM kanban_columns WHERE id=?", (column_id,))
+
+        return {"success": True, "message": "Колонка удалена, карточки перемещены в Неразобранные"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.patch("/kanban/cards/move")
+async def move_kanban_card(
+    req: MoveCardRequest,
+    x_session_token: str = Header(...)
+):
+    try:
+        user = get_user_by_session(x_session_token)
+        if not user:
+            raise HTTPException(status_code=401, detail="SESSION_NOT_FOUND")
+
+        now = datetime.utcnow().isoformat()
+        with get_db() as conn:
+            # Verify column belongs to user
+            to_col = conn.execute(
+                "SELECT * FROM kanban_columns WHERE id=? AND user_id=?",
+                (req.to_column_id, user["id"])
+            ).fetchone()
+            if not to_col:
+                raise HTTPException(status_code=404, detail="Целевая колонка не найдена")
+
+            # Get card
+            card = conn.execute("""
+                SELECT * FROM kanban_cards
+                WHERE transaction_id=? AND board_id=? AND user_id=?
+            """, (req.transaction_id, req.board_id, user["id"])).fetchone()
+            if not card:
+                raise HTTPException(status_code=404, detail="Карточка не найдена")
+
+            # Shift existing cards in target column to make room
+            conn.execute("""
+                UPDATE kanban_cards SET position = position + 1, updated_at=?
+                WHERE column_id=? AND board_id=? AND position >= ?
+            """, (now, req.to_column_id, req.board_id, req.new_index))
+
+            # Move card
+            conn.execute("""
+                UPDATE kanban_cards SET column_id=?, position=?, updated_at=?
+                WHERE id=?
+            """, (req.to_column_id, req.new_index, now, card["id"]))
+
+            # Update transaction category to match column title
+            conn.execute("""
+                UPDATE transactions SET category_id=?, category_title=?, updated_at=?
+                WHERE id=?
+            """, (req.to_column_id, to_col["title"], now, req.transaction_id))
+
+        return {
+            "success": True,
+            "message": "Карточка перемещена",
+            "card": {
+                "transaction_id": req.transaction_id,
+                "column_id": req.to_column_id,
+                "position": req.new_index,
+            }
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
